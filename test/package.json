@@ -1,0 +1,10 @@
+{
+  "name": "chrome-agent-bridge-test",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "ws": "^8.21.0"
+  }
+}

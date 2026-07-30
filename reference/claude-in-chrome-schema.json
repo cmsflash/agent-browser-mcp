@@ -1,0 +1,321 @@
+{
+  "chrome_mcp_tools": [
+    {
+      "name": "mcp__claude-in-chrome__tabs_context_mcp",
+      "description": "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "createIfEmpty": {
+            "description": "Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "returns": "Tab group context information including list of tab IDs"
+    },
+    {
+      "name": "mcp__claude-in-chrome__navigate",
+      "description": "Navigate to a URL, or go forward/back in browser history. tabId may be omitted for URL navigation when calling navigate STANDALONE (not inside browser_batch): tabs_context_mcp{createIfEmpty:true} is called for you and the first tab in the session's group is navigated — its result is appended to this call's output so you have the tab list and ids for subsequent calls. Inside browser_batch, navigate (and other tools that act on a page) requires an explicit tabId. Pass an explicit tabId when you need a specific tab or when the session's group has multiple tabs whose state you must preserve. tabId is required for url:\"back\"/\"forward\".",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "tabId": {
+            "description": "Tab ID to navigate. Must be a tab in the current group. If omitted for URL navigation when calling navigate standalone, tabs_context_mcp{createIfEmpty:true} is called for you. Required for url:\"back\"/\"forward\" and for navigate (and other tools that act on a page) inside browser_batch.",
+            "type": "number"
+          },
+          "url": {
+            "description": "The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use \"forward\" to go forward in history or \"back\" to go back in history.",
+            "type": "string"
+          }
+        },
+        "required": ["url"],
+        "type": "object"
+      },
+      "returns": "Navigation result; when called standalone with URL, also returns updated tab context"
+    },
+    {
+      "name": "mcp__claude-in-chrome__computer",
+      "description": "Use a mouse and keyboard to interact with a web browser, and take screenshots. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.\n* Whenever you intend to click on an element like an icon, you should consult a screenshot to determine the coordinates of the element before moving the cursor.\n* If you tried clicking on a program or link but it failed to load, even after waiting, try adjusting your click location so that the tip of the cursor visually falls on the element that you want to click.\n* Make sure to click any buttons, links, icons, etc with the cursor tip in the center of the element. Don't click boxes on their edges unless asked.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.",
+            "enum": ["left_click", "right_click", "double_click", "triple_click", "type", "screenshot", "wait", "scroll", "key", "left_click_drag", "zoom", "scroll_to", "hover"],
+            "type": "string"
+          },
+          "coordinate": {
+            "description": "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position.",
+            "items": {"type": "number"},
+            "type": "array"
+          },
+          "duration": {
+            "description": "The number of seconds to wait. Required for `wait`. Maximum 10 seconds.",
+            "maximum": 10,
+            "minimum": 0,
+            "type": "number"
+          },
+          "modifiers": {
+            "description": "Modifier keys for click actions. Supports: \"ctrl\", \"shift\", \"alt\", \"cmd\" (or \"meta\"), \"win\" (or \"windows\"). Can be combined with \"+\" (e.g., \"ctrl+shift\", \"cmd+alt\"). Optional.",
+            "type": "string"
+          },
+          "ref": {
+            "description": "Element reference ID from read_page or find tools (e.g., \"ref_1\", \"ref_2\"). Required for `scroll_to` action. Can be used as alternative to `coordinate` for click actions.",
+            "type": "string"
+          },
+          "region": {
+            "description": "(x0, y0, x1, y1): The rectangular region to capture for `zoom`. Coordinates define a rectangle from top-left (x0, y0) to bottom-right (x1, y1) in pixels from the viewport origin. Required for `zoom` action. Useful for inspecting small UI elements like icons, buttons, or text.",
+            "items": {"type": "number"},
+            "type": "array"
+          },
+          "repeat": {
+            "description": "Number of times to repeat the key sequence. Only applicable for `key` action. Must be a positive integer between 1 and 100. Default is 1. Useful for navigation tasks like pressing arrow keys multiple times.",
+            "maximum": 100,
+            "minimum": 1,
+            "type": "number"
+          },
+          "save_to_disk": {
+            "description": "For screenshot/zoom actions: save the image to disk so it can be attached to a message for the user. Returns the saved path in the tool result. Only set this when you intend to share the image — screenshots you're just looking at don't need saving.",
+            "type": "boolean"
+          },
+          "scroll_amount": {
+            "description": "The number of scroll wheel ticks. Optional for `scroll`, defaults to 3.",
+            "maximum": 10,
+            "minimum": 1,
+            "type": "number"
+          },
+          "scroll_direction": {
+            "description": "The direction to scroll. Required for `scroll`.",
+            "enum": ["up", "down", "left", "right"],
+            "type": "string"
+          },
+          "start_coordinate": {
+            "description": "(x, y): The starting coordinates for `left_click_drag`.",
+            "items": {"type": "number"},
+            "type": "array"
+          },
+          "tabId": {
+            "description": "Tab ID to execute the action on. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            "type": "number"
+          },
+          "text": {
+            "description": "The text to type (for `type` action) or the key(s) to press (for `key` action). For `key` action: Provide space-separated keys (e.g., \"Backspace Backspace Delete\"). Supports keyboard shortcuts using the platform's modifier key (use \"cmd\" on Mac, \"ctrl\" on Windows/Linux, e.g., \"cmd+a\" or \"ctrl+a\" for select all).",
+            "type": "string"
+          }
+        },
+        "required": ["action", "tabId"],
+        "type": "object"
+      },
+      "returns": "Screenshot (as image), coordinate information, or action result"
+    },
+    {
+      "name": "mcp__claude-in-chrome__read_page",
+      "description": "Get an accessibility tree representation of elements on the page. By default returns all elements including non-visible ones. Output is limited to 50000 characters by default. If the output exceeds this limit it is truncated at a line boundary, with a note giving the full size — pass a larger max_chars, or use depth/ref_id to focus on part of the page. Optionally filter for only interactive elements. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "depth": {
+            "description": "Maximum depth of the tree to traverse (default: 15). Use a smaller depth if output is too large.",
+            "type": "number"
+          },
+          "filter": {
+            "description": "Filter elements: \"interactive\" for buttons/links/inputs only, \"all\" for all elements including non-visible ones (default: all elements)",
+            "enum": ["interactive", "all"],
+            "type": "string"
+          },
+          "max_chars": {
+            "description": "Maximum characters for output (default: 50000). Set to a higher value if your client can handle large outputs.",
+            "type": "number"
+          },
+          "ref_id": {
+            "description": "Reference ID of a parent element to read. Will return the specified element and all its children. Use this to focus on a specific part of the page when output is too large.",
+            "type": "string"
+          },
+          "tabId": {
+            "description": "Tab ID to read from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            "type": "number"
+          }
+        },
+        "required": ["tabId"],
+        "type": "object"
+      },
+      "returns": "Accessibility tree as text with element reference IDs"
+    },
+    {
+      "name": "mcp__claude-in-chrome__tabs_create_mcp",
+      "description": "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "properties": {},
+        "type": "object"
+      },
+      "returns": "New tab ID and updated tab context"
+    },
+    {
+      "name": "mcp__claude-in-chrome__get_page_text",
+      "description": "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "tabId": {
+            "description": "Tab ID to extract text from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            "type": "number"
+          }
+        },
+        "required": ["tabId"],
+        "type": "object"
+      },
+      "returns": "Plain text content of the page"
+    },
+    {
+      "name": "mcp__claude-in-chrome__form_input",
+      "description": "Set values in form elements using element reference ID from the read_page tool. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "ref": {
+            "description": "Element reference ID from the read_page tool (e.g., \"ref_1\", \"ref_2\")",
+            "type": "string"
+          },
+          "tabId": {
+            "description": "Tab ID to set form value in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            "type": "number"
+          },
+          "value": {
+            "description": "The value to set. For checkboxes use boolean, for selects use option value or text, for other inputs use appropriate string/number"
+          }
+        },
+        "required": ["ref", "tabId"],
+        "type": "object"
+      },
+      "returns": "Success/failure confirmation"
+    },
+    {
+      "name": "mcp__claude-in-chrome__javascript_tool",
+      "description": "Execute JavaScript code in the context of the current page. The code runs in the page's context and can interact with the DOM, window object, and page variables. Returns the result of the last expression or any thrown errors. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Must be set to 'javascript_exec'",
+            "type": "string"
+          },
+          "tabId": {
+            "description": "Tab ID to execute the code in. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            "type": "number"
+          },
+          "text": {
+            "description": "The JavaScript code to execute. Evaluated in the page context with REPL semantics: top-level `await` works, and the result of the last expression is returned automatically — write the expression you want (e.g. `window.myData.value`, or `await fetch(url).then(r=>r.json())`) rather than `return ...`. You can access and modify the DOM, call page functions, and interact with page variables.",
+            "type": "string"
+          }
+        },
+        "required": ["action", "text", "tabId"],
+        "type": "object"
+      },
+      "returns": "Result of the last JavaScript expression, or error message"
+    },
+    {
+      "name": "mcp__claude-in-chrome__gif_creator",
+      "description": "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, either provide 'coordinate' to drag/drop upload to a page element, or set 'download: true' to download the GIF.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "description": "Action to perform: 'start_recording' (begin capturing), 'stop_recording' (stop capturing but keep frames), 'export' (generate and export GIF), 'clear' (discard frames)",
+            "enum": ["start_recording", "stop_recording", "export", "clear"],
+            "type": "string"
+          },
+          "download": {
+            "description": "Always set this to true for the 'export' action only. This causes the gif to be downloaded in the browser.",
+            "type": "boolean"
+          },
+          "filename": {
+            "description": "Optional filename for exported GIF (default: 'recording-[timestamp].gif'). For 'export' action only.",
+            "type": "string"
+          },
+          "options": {
+            "additionalProperties": true,
+            "description": "Optional GIF enhancement options for 'export' action. Properties: showClickIndicators (bool), showDragPaths (bool), showActionLabels (bool), showProgressBar (bool), showWatermark (bool), quality (number 1-30). All default to true except quality (default: 10).",
+            "properties": {
+              "quality": {
+                "description": "GIF compression quality, 1-30 (lower = better quality, slower encoding). Default: 10",
+                "type": "number"
+              },
+              "showActionLabels": {
+                "description": "Show black labels describing actions (default: true)",
+                "type": "boolean"
+              },
+              "showClickIndicators": {
+                "description": "Show orange circles at click locations (default: true)",
+                "type": "boolean"
+              },
+              "showDragPaths": {
+                "description": "Show red arrows for drag actions (default: true)",
+                "type": "boolean"
+              },
+              "showProgressBar": {
+                "description": "Show orange progress bar at bottom (default: true)",
+                "type": "boolean"
+              },
+              "showWatermark": {
+                "description": "Show Claude logo watermark (default: true)",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "tabId": {
+            "description": "Tab ID to identify which tab group this operation applies to",
+            "type": "number"
+          }
+        },
+        "required": ["action", "tabId"],
+        "type": "object"
+      },
+      "returns": "Recording state or GIF file path/download link"
+    },
+    {
+      "name": "mcp__claude-in-chrome__read_console_messages",
+      "description": "Read browser console messages (console.log, console.error, console.warn, etc.) from a specific tab. Useful for debugging JavaScript errors, viewing application logs, or understanding what's happening in the browser console. Returns console messages from the current domain only. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs. IMPORTANT: Always provide a pattern to filter messages - without a pattern, you may get too many irrelevant messages.",
+      "parameters": {
+        "$schema": "http://json-schema.org/draft-07/schema#",
+        "additionalProperties": false,
+        "properties": {
+          "clear": {
+            "description": "If true, clear the console messages after reading to avoid duplicates on subsequent calls. Default is false.",
+            "type": "boolean"
+          },
+          "limit": {
+            "description": "Maximum number of messages to return. Defaults to 100. Increase only if you need more results.",
+            "type": "number"
+          },
+          "onlyErrors": {
+            "description": "If true, only return error and exception messages. Default is false (return all message types).",
+            "type": "boolean"
+          },
+          "pattern": {
+            "description": "Regex pattern to filter console messages. Only messages matching this pattern will be returned (e.g., 'error|warning' to find errors and warnings, 'MyApp' to filter app-specific logs). You should always provide a pattern to avoid getting too many irrelevant messages.",
+            "type": "string"
+          },
+          "tabId": {
+            "description": "Tab ID to read console messages from. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.",
+            "type": "number"
+          }
+        },
+        "required": ["tabId", "pattern"],
+        "type": "object"
+      },
+      "returns": "Array of console messages matching pattern"
+    }
+  ]
+}

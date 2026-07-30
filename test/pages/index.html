@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Agent Bridge Test Page</title>
+<style>
+  body { font: 14px sans-serif; margin: 20px; }
+  section { border: 1px solid #ccc; padding: 10px; margin-bottom: 12px; }
+  #pointerBox { width: 60px; height: 60px; background: tomato; position: absolute; left: 20px; top: 30px; cursor: grab; user-select: none; }
+  #pointerArena { position: relative; height: 160px; background: #f4f4f4; }
+  #pointerTarget { position: absolute; right: 20px; top: 20px; width: 100px; height: 100px; background: #cfe8cf; }
+  #dragme { padding: 8px; background: #ffe08a; display: inline-block; }
+  #dropzone { margin-top: 8px; padding: 20px; background: #d8e6f7; }
+  #tall { height: 3000px; background: linear-gradient(#fff, #dde); }
+  .log { font-family: monospace; font-size: 12px; white-space: pre-wrap; max-height: 90px; overflow: auto; background: #fafafa; }
+</style>
+</head>
+<body>
+<h1>Agent Bridge Test Page</h1>
+
+<section id="clicks">
+  <h2>Clicks</h2>
+  <button id="inc">Increment</button> <span id="count">0</span>
+  <button id="events">Event target</button>
+  <button id="ghost" style="display:none">Ghost button</button>
+  <p id="tripleText">Select me entirely with a triple click for the test.</p>
+  <div id="clickLog" class="log"></div>
+</section>
+
+<section id="forms">
+  <h2>Forms</h2>
+  <input id="textInput" type="text" placeholder="Type here">
+  <input id="reactish" type="text" placeholder="reactish">
+  <div id="editable" contenteditable="true" style="border:1px dashed #999;padding:4px;">edit me</div>
+  <select id="pet" aria-label="Pet">
+    <option value="">--</option>
+    <option value="dog">Dog</option>
+    <option value="cat">Cat</option>
+    <option value="fish">Fish</option>
+  </select>
+  <input id="check" type="checkbox" aria-label="Agree">
+  <input type="radio" name="size" id="sizeS" value="s"><label for="sizeS">S</label>
+  <input type="radio" name="size" id="sizeL" value="l"><label for="sizeL">L</label>
+  <input id="range" type="range" min="0" max="100" value="50" aria-label="Volume">
+  <form id="searchForm"><input id="searchBox" type="search" placeholder="Search"><span id="submitted"></span></form>
+  <input id="fileInput" type="file" multiple aria-label="Upload">
+  <div id="uploadResult" class="log"></div>
+</section>
+
+<section id="keyboard">
+  <h2>Keyboard</h2>
+  <input id="keyInput" type="text" placeholder="Keys land here">
+  <div id="keyLog" class="log"></div>
+</section>
+
+<section id="dragging">
+  <h2>Pointer drag</h2>
+  <div id="pointerArena">
+    <div id="pointerBox"></div>
+    <div id="pointerTarget"></div>
+  </div>
+  <div id="pointerStatus">idle</div>
+  <h2>HTML5 drag</h2>
+  <div id="dragme" draggable="true">Drag me</div>
+  <div id="dropzone">Drop here</div>
+  <div id="html5Status">idle</div>
+</section>
+
+<section id="async">
+  <h2>Async</h2>
+  <button id="delayed">Load delayed content</button>
+  <div id="delayedOut"></div>
+  <button id="fetcher">Fetch data</button>
+  <div id="fetchOut"></div>
+  <button id="logger">Log to console</button>
+</section>
+
+<section>
+  <h2>Navigation</h2>
+  <a id="toSecond" href="/second.html">Go to second page</a>
+</section>
+
+<div id="tall">tall filler</div>
+<p id="bottomMarker">BOTTOM_OF_PAGE_MARKER</p>
+
+<script>
+  const $ = (s) => document.querySelector(s);
+  const log = (el, msg) => { el.textContent += msg + "\n"; };
+
+  // clicks
+  let count = 0;
+  $("#inc").addEventListener("click", (e) => {
+    count++; $("#count").textContent = String(count);
+    log($("#clickLog"), `click detail=${e.detail} shift=${e.shiftKey} trusted=${e.isTrusted}`);
+  });
+  $("#events").addEventListener("dblclick", () => log($("#clickLog"), "dblclick"));
+  $("#events").addEventListener("contextmenu", (e) => { e.preventDefault(); log($("#clickLog"), "contextmenu"); });
+  $("#events").addEventListener("auxclick", (e) => { if (e.button === 1) log($("#clickLog"), "middleclick"); });
+
+  // reactish input: framework-style tracked value
+  let reactVal = null;
+  $("#reactish").addEventListener("input", (e) => { reactVal = e.target.value; window.__reactVal = reactVal; });
+
+  // search form submit
+  $("#searchForm").addEventListener("submit", (e) => { e.preventDefault(); $("#submitted").textContent = "SUBMITTED:" + $("#searchBox").value; });
+
+  // file upload
+  $("#fileInput").addEventListener("change", (e) => {
+    $("#uploadResult").textContent = Array.from(e.target.files).map((f) => `${f.name}:${f.size}`).join(",");
+  });
+
+  // keyboard
+  const keyLog = $("#keyLog");
+  let holdStart = 0;
+  $("#keyInput").addEventListener("keydown", (e) => {
+    if (!e.repeat) holdStart = performance.now();
+    log(keyLog, `down:${e.key} ctrl=${e.ctrlKey} meta=${e.metaKey} shift=${e.shiftKey} alt=${e.altKey}${e.repeat ? " repeat" : ""}`);
+  });
+  $("#keyInput").addEventListener("keyup", (e) => {
+    const held = Math.round(performance.now() - holdStart);
+    log(keyLog, `up:${e.key} held=${held}ms`);
+    window.__lastHold = { key: e.key, held };
+  });
+
+  // pointer drag
+  const box = $("#pointerBox");
+  let dragging = false, ox = 0, oy = 0;
+  box.addEventListener("mousedown", (e) => { dragging = true; ox = e.offsetX; oy = e.offsetY; $("#pointerStatus").textContent = "dragging"; });
+  document.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    const arena = $("#pointerArena").getBoundingClientRect();
+    box.style.left = (e.clientX - arena.left - ox) + "px";
+    box.style.top = (e.clientY - arena.top - oy) + "px";
+  });
+  document.addEventListener("mouseup", () => {
+    if (!dragging) return;
+    dragging = false;
+    const b = box.getBoundingClientRect(), t = $("#pointerTarget").getBoundingClientRect();
+    const cx = b.x + b.width / 2, cy = b.y + b.height / 2;
+    const hit = cx >= t.x && cx <= t.x + t.width && cy >= t.y && cy <= t.y + t.height;
+    $("#pointerStatus").textContent = hit ? "pointer-drop-ok" : "pointer-drop-miss";
+  });
+
+  // html5 drag
+  $("#dragme").addEventListener("dragstart", (e) => e.dataTransfer.setData("text/plain", "payload-42"));
+  $("#dropzone").addEventListener("dragover", (e) => e.preventDefault());
+  $("#dropzone").addEventListener("drop", (e) => {
+    e.preventDefault();
+    $("#html5Status").textContent = "html5-drop-ok:" + e.dataTransfer.getData("text/plain");
+  });
+
+  // async
+  $("#delayed").addEventListener("click", () => {
+    setTimeout(() => { $("#delayedOut").textContent = "DELAYED_CONTENT_READY"; }, 800);
+  });
+  $("#fetcher").addEventListener("click", async () => {
+    const r = await fetch("/api/data.json");
+    const j = await r.json();
+    $("#fetchOut").textContent = "fetched:" + j.answer;
+  });
+  $("#logger").addEventListener("click", () => {
+    console.log("hello-console-123");
+    console.error("err-456");
+  });
+</script>
+</body>
+</html>

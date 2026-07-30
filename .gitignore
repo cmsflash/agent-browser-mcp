@@ -1,0 +1,5 @@
+node_modules/
+test/browsers/
+.DS_Store
+*.log
+coverage/

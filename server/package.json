@@ -1,0 +1,17 @@
+{
+  "name": "chrome-agent-bridge-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "MCP server for the Chrome Agent Bridge extension — drives Chrome in the background inside reconnectable agent tab groups.",
+  "main": "index.mjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "fast-png": "^8.0.0",
+    "gifenc": "^1.0.3",
+    "ws": "^8.18.0"
+  }
+}

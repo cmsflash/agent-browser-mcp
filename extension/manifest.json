@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Chrome Agent Bridge",
+  "version": "1.1.1",
+  "description": "Lets local AI agents (Claude Cowork / Claude Code via MCP) drive Chrome in the background inside isolated, reconnectable tab groups.",
+  "minimum_chrome_version": "116",
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "permissions": [
+    "tabs",
+    "tabGroups",
+    "scripting",
+    "debugger",
+    "storage",
+    "alarms",
+    "downloads",
+    "notifications"
+  ],
+  "host_permissions": ["<all_urls>"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "Chrome Agent Bridge"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
