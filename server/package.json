@@ -9,7 +9,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "fast-png": "^8.0.0",
     "gifenc": "^1.0.3",
     "ws": "^8.18.0"
