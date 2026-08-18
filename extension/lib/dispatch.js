@@ -27,9 +27,12 @@ async function selfIdentity() {
   };
 }
 
+// Every tab-scoped command proves the tab belongs to the calling thread's own
+// group before doing anything to it.
 async function requireTab(params) {
   if (params.tabId == null) throw new Error("tabId is required — call tabs_context_mcp (or create a tab) first.");
-  await tabs.getTab(params.tabId); // throws if gone; wakes frozen/discarded tabs
+  await tabs.assertTabInGroup(params.tabId, params.groupId);
+  await tabs.getTab(params.tabId); // wakes frozen/discarded tabs
   return params.tabId;
 }
 
@@ -191,7 +194,45 @@ async function shortcutsList() {
   };
 }
 
+// Commands that operate on the browser at large rather than on a thread's tabs.
+const THREADLESS = new Set([
+  "status", "reload_self", "reload_extension", "download_data", "shortcuts_list",
+  "hub:list_browsers", "hub:select_browser", "hub:switch_browser",
+]);
+
+// Only these bring a workspace (and its browser window) into being. Everything
+// else — reads, cleanup — must observe the workspace as it is: otherwise
+// listing tabs right after deleting them would silently reopen a window, and an
+// empty workspace could never be observed as empty.
+const CREATES_WORKSPACE = new Set(["tabs_create", "new_tab"]);
+
+// Reclaiming stale groups needs no timer: sweep opportunistically, at most
+// hourly, on whatever command happens to arrive.
+let lastGcAt = 0;
+async function maybeGc() {
+  if (Date.now() - lastGcAt < 60 * 60 * 1000) return;
+  lastGcAt = Date.now();
+  try { await groups.gcStaleThreads(); } catch (_) {}
+}
+
 export async function handle(method, params = {}) {
+  // ── the thread-identity chokepoint ──
+  // Resolve (creating on first use) THE one group owned by this threadTitle and
+  // inject it as groupId. Downstream code can therefore only ever act inside
+  // the caller's own group: there is no parameter that selects another one.
+  if (!THREADLESS.has(method)) {
+    void maybeGc();
+    const g = await groups.groupForThread(params.threadTitle, { create: CREATES_WORKSPACE.has(method) });
+    if (!g) {
+      if (method === "delete_my_tabs") return { deleted: true, closedTabs: 0, note: "nothing to delete — this thread had no workspace" };
+      if (method === "tabs_context" || method === "list_tabs") {
+        return { tabs: [], note: "You have no tabs yet. Create one (tabs_create_mcp or new_tab) to start your workspace." };
+      }
+      throw new Error("You have no tabs yet — create one with tabs_create_mcp or new_tab first.");
+    }
+    params = { ...params, groupId: g.groupId };
+  }
+
   switch (method) {
     // status
     case "status": {
@@ -199,26 +240,18 @@ export async function handle(method, params = {}) {
       return {
         connected: true,
         extensionVersion: chrome.runtime.getManifest().version,
-        groups: reg.groups.map((g) => ({ groupId: g.groupId, name: g.name, status: g.status, tabCount: g.tabs.length })),
+        threads: reg.groups.length,
       };
     }
 
-    // official tab model
+    // tab model (always scoped to the caller's own group)
     case "tabs_context": return await tabs.tabsContext(params);
     case "tabs_create": return await tabs.tabsCreate(params);
-    case "tabs_close": return await tabs.tabsClose(params);
-    case "resize_window": {
-      await requireTab(params);
-      return await tabs.resizeWindow(params);
-    }
+    case "resize_window": return await tabs.resizeWindow(params);
 
-    // groups
-    case "create_tab_group": return await groups.createGroup(params);
-    case "list_tab_groups": return await groups.listGroups();
-    case "reconnect_tab_group": return await groups.reconnectGroup(params.groupId, { restore: !!params.restore });
-    case "update_tab_group": return await groups.updateGroup(params.groupId, params);
-    case "close_tab_group": {
-      // detach any debuggers on the group's tabs first
+    // The thread's own workspace: delete everything it opened. There is no
+    // "close" variant, because closing leaves a saved group behind.
+    case "delete_my_tabs": {
       try {
         const { live } = await groups.resolveGroup(params.groupId);
         if (live) {
@@ -226,7 +259,7 @@ export async function handle(method, params = {}) {
           await Promise.all(groupTabs.map((t) => cdp.detach(t.id)));
         }
       } catch (_) {}
-      return await groups.closeGroup(params.groupId, { keepRecord: !!params.keepRecord });
+      return await groups.deleteGroup(params.groupId);
     }
 
     // tabs
@@ -297,7 +330,10 @@ export async function handle(method, params = {}) {
     case "wait_for": return await actions.waitFor(await requireTab(params), params);
 
     // gif recording
-    case "gif_creator": return await gifCreator(params);
+    case "gif_creator": {
+      await requireTab(params);
+      return await gifCreator(params);
+    }
     case "download_data": {
       if (!params.dataUrl || !params.filename) throw new Error("filename and dataUrl are required");
       const id = await chrome.downloads.download({

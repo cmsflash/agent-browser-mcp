@@ -23,13 +23,28 @@ const port = Number(process.env.CHROME_AGENT_PORT || DEFAULT_PORT);
 const bridge = new Bridge(port);
 await bridge.start();
 
-// ---------- per-thread session state ----------
+// ---------- session state ----------
+//
+// A single MCP process may serve MORE THAN ONE agent thread: some hosts share
+// one server across all sessions, and a process can be restarted mid-thread.
+// So the thread's browser workspace is keyed by the threadTitle it passes on
+// every call (resolved to a group inside the extension), and the only
+// per-thread state we keep here is a convenience "current tab" cache.
 
 const session = {
-  groupId: null,   // internal group id (grp_…) — the "MCP tab group" of this session
-  tabId: null,
   browserId: null, // deviceId of the selected browser (null = most recent)
 };
+
+// threadTitle -> last tab this thread touched (so tabId can be omitted).
+const currentTab = new Map();
+const MAX_THREADS = 200;
+
+function rememberTab(thread, tabId) {
+  if (!thread || tabId == null) return;
+  currentTab.delete(thread);
+  currentTab.set(thread, tabId);
+  while (currentTab.size > MAX_THREADS) currentTab.delete(currentTab.keys().next().value);
+}
 
 // screenshot cache for upload_image: imageId -> {data(base64), mimeType}
 const imageCache = new Map();
@@ -44,7 +59,7 @@ function cacheImage(data, mimeType) {
 const byName = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
 
 // Destructive tools must never inherit an implicit target.
-const NO_TAB_DEFAULT = new Set(["close_tab", "tabs_close_mcp"]);
+const NO_TAB_DEFAULT = new Set(["close_tab"]);
 
 const DOWNLOADS = process.env.CHROME_AGENT_DOWNLOADS_DIR || join(homedir(), "Downloads");
 try { mkdirSync(DOWNLOADS, { recursive: true }); } catch {}
@@ -53,57 +68,38 @@ try { mkdirSync(DOWNLOADS, { recursive: true }); } catch {}
 
 function applySessionDefaults(name, args, { inBatch = false } = {}) {
   const a = { ...args };
+  const thread = a.threadTitle;
   const wantsTab = "tabId" in (byName[name]?.inputSchema?.properties || {});
-  if (wantsTab && !NO_TAB_DEFAULT.has(name) && a.tabId == null && session.tabId != null && !inBatch) {
-    a.tabId = session.tabId; // aligned: inside a batch, tabId must be explicit
+  if (wantsTab && !NO_TAB_DEFAULT.has(name) && a.tabId == null && !inBatch) {
+    const known = currentTab.get(thread);
+    if (known != null) a.tabId = known; // aligned: inside a batch, tabId must be explicit
   }
-  if (name === "new_tab" && !a.groupId && !a.ungrouped && session.groupId) a.groupId = session.groupId;
-  if (name === "list_tabs" && !a.groupId && !a.all && session.groupId) a.groupId = session.groupId;
-  if ((name === "tabs_context_mcp" || name === "tabs_create_mcp") && session.groupId) a.groupId = session.groupId;
-  if (name === "tabs_close_mcp") a.groupId = session.groupId; // strict: session group only
   return a;
 }
 
 function updateSession(name, args, result) {
+  const thread = args.threadTitle;
   switch (name) {
-    case "create_tab_group":
     case "tabs_context_mcp":
-      if (result.groupId) {
-        session.groupId = result.groupId;
-        const ids = [result.tabId, ...(result.tabs || []).map((t) => t.tabId)].filter((x) => x != null);
-        // adopt a tab whenever the current one isn't part of this group —
-        // this is how a session recovers from a tab that died externally
-        if (ids.length && !ids.includes(session.tabId)) session.tabId = ids[0];
-      }
+    case "list_tabs": {
+      const ids = (result.tabs || []).map((t) => t.tabId).filter((x) => x != null);
+      // Adopt a tab whenever the remembered one is no longer in the workspace —
+      // this is how a thread recovers from a tab that died externally.
+      if (ids.length && !ids.includes(currentTab.get(thread))) rememberTab(thread, ids[0]);
       break;
-    case "reconnect_tab_group":
-      if (result.status === "connected" || result.status === "restored") {
-        session.groupId = result.groupId;
-        if (result.tabs?.length) session.tabId = result.tabs[0].tabId;
-      }
-      break;
+    }
     case "new_tab":
     case "tabs_create_mcp":
-      if (result.tabId != null) session.tabId = result.tabId;
-      // tabs_create_mcp/new_tab may have auto-created the session group
-      if (!session.groupId && (result.agentGroupId || result.context?.groupId)) {
-        session.groupId = result.agentGroupId || result.context.groupId;
-      }
+      if (result.tabId != null) rememberTab(thread, result.tabId);
       break;
     case "navigate":
-      if (args.tabId != null) session.tabId = args.tabId;
+      if (args.tabId != null) rememberTab(thread, args.tabId);
       break;
     case "close_tab":
-    case "tabs_close_mcp":
-      if (args.tabId === session.tabId) session.tabId = null;
+      if (args.tabId === currentTab.get(thread)) currentTab.delete(thread);
       break;
-    case "close_tab_group":
-      if (args.groupId === session.groupId) {
-        session.groupId = null;
-        session.tabId = null;
-      } else if (result?.closedTabIds?.includes(session.tabId)) {
-        session.tabId = null;
-      }
+    case "delete_my_tabs":
+      currentTab.delete(thread);
       break;
     case "select_browser":
     case "switch_browser":
@@ -156,6 +152,11 @@ async function ensureBrowserPinned() {
 async function runTool(name, rawArgs, { inBatch = false, noSession = false } = {}) {
   const tool = byName[name];
   if (!tool) throw new Error(`Unknown tool: ${name}`);
+  if (tool.inputSchema.required.includes("threadTitle") && !String(rawArgs?.threadTitle ?? "").trim()) {
+    throw new Error(
+      `${name} requires threadTitle: a short, stable, distinctive title for YOUR agent thread (e.g. "Refactor auth flow"). It identifies your private browser workspace — pass the same value on every call.`
+    );
+  }
   const args = applySessionDefaults(name, rawArgs || {}, { inBatch: inBatch || noSession });
 
   // ----- server-side composite tools -----
@@ -173,8 +174,8 @@ async function runTool(name, rawArgs, { inBatch = false, noSession = false } = {
     const msg = String(e.message || e);
     // the session's tab died outside our view — drop it so tabs_context/
     // navigate auto-context can recover instead of failing forever
-    if (args.tabId != null && args.tabId === session.tabId && /does not exist/.test(msg)) {
-      session.tabId = null;
+    if (args.tabId != null && args.tabId === currentTab.get(args.threadTitle) && /does not exist/.test(msg)) {
+      currentTab.delete(args.threadTitle);
     }
     // pinned browser vanished, but exactly one is connected → repin + retry
     if (/is not connected/.test(msg) && session.browserId) {
@@ -205,32 +206,36 @@ async function runTool(name, rawArgs, { inBatch = false, noSession = false } = {
   if (name === "get_status") {
     result.serverVersion = VERSION;
     result.session = {
-      currentGroupId: session.groupId,
-      currentTabId: session.tabId,
       selectedBrowser: session.browserId,
       bridgeMode: bridge.mode,
+      threadsSeen: currentTab.size,
     };
   }
   return result;
 }
 
-// navigate standalone: auto-create context when the session has no tab yet
+// navigate standalone: adopt (or create) a tab in this thread's workspace when
+// the caller didn't name one.
 async function runNavigate(args, tool) {
+  const thread = args.threadTitle;
   const keyword = String(args.url || "").toLowerCase();
   const isHistory = keyword === "back" || keyword === "forward" || keyword === "reload";
-  if (args.tabId == null && !isHistory) {
-    const ctx = await runTool("tabs_context_mcp", { createIfEmpty: true });
-    const tabId = ctx.tabs?.[0]?.tabId;
+  if (args.tabId == null && isHistory) throw new Error(`tabId is required for url:"${keyword}".`);
+
+  if (args.tabId == null) {
+    const ctx = await runTool("tabs_context_mcp", { threadTitle: thread });
+    let tabId = ctx.tabs?.[0]?.tabId;
+    if (tabId == null) {
+      const made = await runTool("tabs_create_mcp", { threadTitle: thread });
+      tabId = made.tabId;
+    }
     if (tabId == null) throw new Error("Could not create a tab for navigation — is Chrome running?");
     const nav = await bridge.call("navigate", { ...args, tabId }, toolTimeout(tool, args), session.browserId);
-    session.tabId = tabId;
+    rememberTab(thread, tabId);
     return { ...nav, context: ctx };
   }
-  if (args.tabId == null && isHistory) {
-    throw new Error(`tabId is required for url:"${keyword}".`);
-  }
   const result = await bridge.call("navigate", args, toolTimeout(tool, args), session.browserId);
-  session.tabId = args.tabId;
+  rememberTab(thread, args.tabId);
   return result;
 }
 
@@ -256,7 +261,9 @@ async function runBatch(args) {
       if (PAGE_TOOLS_NEED_TAB.has(name) && (input?.tabId == null)) {
         throw new Error(`${name} requires an explicit tabId inside browser_batch`);
       }
-      const result = await runTool(name, input, { inBatch: true });
+      // Steps inherit the batch's thread identity, so it isn't repeated 25 times.
+      const stepInput = { threadTitle: args.threadTitle, ...(input || {}) };
+      const result = await runTool(name, stepInput, { inBatch: true });
       if (result && result.__content) {
         content.push({ type: "text", text: label + ":" }, ...result.__content);
       } else if (isImageResult(result)) {
@@ -289,6 +296,7 @@ async function runUploadImage(args) {
   return bridge.call(
     "upload_image_inject",
     {
+      threadTitle: args.threadTitle,
       tabId: args.tabId,
       ref: args.ref,
       coordinate: args.coordinate,
@@ -353,6 +361,7 @@ async function runShortcut(args) {
     for (const [i, step] of (sc.steps || []).entries()) {
       try {
         const input = JSON.parse(JSON.stringify(step.input || {}).replaceAll('"$TAB"', String(tabId)));
+        input.threadTitle = args.threadTitle;
         // noSession: background steps must not mutate the session state the
         // agent's foreground calls rely on
         await runTool(step.name, input, { inBatch: true, noSession: true });

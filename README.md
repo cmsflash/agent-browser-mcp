@@ -2,8 +2,12 @@
 
 A self-owned clone of the Claude-in-Chrome integration that works with **Claude
 Cowork**, Claude Code, and any MCP client. It drives your real, logged-in
-Chrome **in the background** — agents work inside isolated, **reconnectable tab
-groups** while you keep using your machine (and even Chrome itself) normally.
+Chrome **in the background** — each agent thread is confined to its own
+**private tab group** while you keep using your machine (and Chrome) normally.
+
+Isolation is **enforced, not advised**: every tool takes a required
+`threadTitle`, the bridge maps that to exactly one tab group, and an agent can
+neither see nor touch anything outside it — not other threads' tabs, not yours.
 
 ```
 Cowork thread A ──stdio MCP──▶ server (HUB, ws://127.0.0.1:47120)◀──WebSocket── Chrome extension
@@ -11,15 +15,16 @@ Cowork thread B ──stdio MCP──▶ server (RELAY ─▶ hub)              
                                                               tab groups + CDP (debugger)
 ```
 
-- **`extension/`** — Manifest V3 extension. Tab-group registry with stable
-  internal IDs (`grp_…`) persisted in `chrome.storage.local`; trusted input,
+- **`extension/`** — Manifest V3 extension. Owns the `threadTitle → tab group`
+  registry (persisted in `chrome.storage.local`) and enforces the boundary:
+  a command may only touch tabs in its own thread's group. Trusted input,
   screenshots, JS, console/network capture via `chrome.debugger` (CDP) — all of
   which work on **background tabs without focusing Chrome**.
-- **`server/`** — stdio MCP server (40 tools, claude-in-chrome-aligned). First process binds the port and
+- **`server/`** — stdio MCP server (35 tools). First process binds the port and
   becomes the hub; further agent threads run as relays through it, so any
   number of concurrent agents share the one extension.
-- **`skills/chrome-agent/`** — the agent-facing skill describing the default
-  workflow (one group per thread, reconnect-on-restart, background etiquette).
+- **`skills/chrome-agent/`** — the agent-facing skill: the `threadTitle`
+  contract, cleaning up with `delete_my_tabs`, background etiquette.
 
 ## Install
 
@@ -46,20 +51,26 @@ Optional: launch Chrome with `--silent-debugger-extension-api` to hide the
 
 | Requirement | How it's met |
 |---|---|
-| Tab-group lifecycle + reconnection | `create_tab_group` returns a stable internal ID; registry survives extension/browser restarts (rebind by name/color, or restore from tab snapshot); `close_tab_group` closes and/or forgets. |
+| One tab group per agent thread | **Enforced.** Every tool requires `threadTitle`; the extension resolves it to that thread's single group (created on first use) and injects it. No tool accepts a group id, so a thread cannot select, create or enumerate another group. |
+| A thread may only touch its own tabs | Every tab-scoped command passes through `assertTabInGroup`, which refuses any tab outside the caller's group — including the user's own tabs. `list_tabs` has no `all:true`. |
+| Cleanup leaves nothing behind | `delete_my_tabs` **ungroups before closing**, which is what actually removes the group; closing alone would leave a Chrome saved group (and sync it to the user's account). Abandoned workspaces are GC'd after 24h without activity. |
+| Identity survives process churn | `threadTitle` is a request parameter, not connection state, so it works whether the host gives each thread its own MCP process or shares one across all of them, and it survives a server restart mid-thread. |
 | Background driving | Agent groups live in their own background window (never focused), tabs are created `active:false`; input + screenshots go through CDP, which doesn't need visibility. `bring_to_foreground` is the single explicit exception. |
-| Ungrouped tabs = exception | `new_tab` refuses to create loose tabs unless `ungrouped:true`; `list_tabs {all:true}` labels the user's tabs `managed:false`. |
 | Text or visual page reps | `read_page` (outline + refs), `get_page_text`, `find`, `screenshot` (viewport / full-page / element, CSS-pixel-aligned with `computer` coordinates). |
 | Element / JS / coordinate interaction | `click`/`fill`/`form_input`/`drag_and_drop`/`upload_file` by ref or selector; `execute_javascript`; `computer` by coordinates. |
 | All user input primitives | left/right/middle clicks, double/triple clicks, modifier-clicks, mouse move/down/up, pointer & HTML5 drag-and-drop, wheel scrolling, full keyboard incl. chords and hold, typing, file upload. |
 
-## Tools (40) — aligned with claude-in-chrome (v1.1.0)
+## Tools (35)
 
-The primary surface is a verbatim alignment with the official claude-in-chrome
-MCP — same names, same parameter schemas, same semantics (see
-`reference/alignment-map.md`):
+**Every tool below requires `threadTitle`**, except `get_status`,
+`list_connected_browsers`, `select_browser`, `switch_browser` and
+`reload_extension` (browser-wide utilities that touch no tabs).
 
-`tabs_context_mcp` · `tabs_create_mcp` · `tabs_close_mcp` · `navigate` ·
+Names and parameters otherwise track the official claude-in-chrome MCP (see
+`reference/alignment-map.md`); the differences are the mandatory `threadTitle`,
+the removal of all tab-group management, and `delete_my_tabs`:
+
+`tabs_context_mcp` · `tabs_create_mcp` · `navigate` ·
 `computer` (incl. `zoom`, `scroll_to`, `hover`, ref targeting, key sequences)
 · `read_page` (`filter`/`depth`/`max_chars`/`ref_id`) · `get_page_text` ·
 `find` (natural language) · `form_input` · `javascript_tool` (REPL) ·
@@ -68,13 +79,17 @@ MCP — same names, same parameter schemas, same semantics (see
 `list_connected_browsers` · `select_browser` · `switch_browser` ·
 `shortcuts_list` · `shortcuts_execute`
 
-Plus the durable chrome-agent extension layer:
+Plus the chrome-agent extension layer:
 
-`get_status` · `create_tab_group` · `list_tab_groups` · `reconnect_tab_group` ·
-`update_tab_group` · `close_tab_group` · `new_tab` · `list_tabs` · `close_tab`
-· `bring_to_foreground` · `screenshot` (fullPage/element + imageId) ·
+`get_status` · `delete_my_tabs` · `new_tab` · `list_tabs` · `close_tab` ·
+`bring_to_foreground` · `screenshot` (fullPage/element + imageId) ·
 `set_viewport` · `click` · `fill` · `drag_and_drop` · `wait_for` ·
 `get_response_body` · `reload_extension`
+
+Removed on purpose: `create_tab_group`, `list_tab_groups`,
+`reconnect_tab_group`, `update_tab_group`, `close_tab_group`, `tabs_close_mcp`,
+`list_tabs {all:true}` and `new_tab {ungrouped:true}` — groups are no longer an
+agent-facing concept, and "close" is never the right cleanup verb (see below).
 
 Shortcuts are user-defined in `chrome.storage.local` under `shortcuts`:
 `[{id, command, description, isWorkflow, steps: [{name, input}]}]` with
@@ -97,6 +112,7 @@ npx @puppeteer/browsers install chrome@stable --path ./browsers   # once
 
 # isolated (throwaway browser — never touches your real Chrome)
 node e2e.mjs                    # 137-assertion full tool matrix
+node thread-isolation.mjs       # enforced one-group-per-thread + true delete
 node freeze-recovery.mjs        # frozen-renderer recovery
 node background-guarantee.mjs   # OS-level focus-steal check
 
@@ -104,11 +120,16 @@ node background-guarantee.mjs   # OS-level focus-steal check
 node smoke-real.mjs             # connect, browse, screenshot, click, reconnect
 node reconnect-real.mjs         # agent restarts, reconnects to its group by ID
 node aligned-real.mjs           # tabs_context/zoom/batch/gif/resize/browsers
+node thread-isolation-real.mjs  # 25 assertions: isolation + delete, self-cleaning
 node frontmost-real.mjs         # macOS frontmost check in the real profile
 ```
 
-Tests need **Chrome for Testing** (branded Chrome ≥137 ignores
-`--load-extension`). **Test isolation matters here:** the production extension
+Tests need **Chrome for Testing**, and specifically a build that still honours
+`--load-extension` (Chrome ≥137 ignores it, and newer Chrome-for-Testing builds
+do too, so `harness.mjs` picks the newest installed build **≤136** rather than
+the newest overall — otherwise every test fails with "extension never
+connected"). Install one with
+`npx @puppeteer/browsers install chrome@136 --path ./browsers`. **Test isolation matters here:** the production extension
 dials `127.0.0.1:47120`, so if it's loaded in your everyday Chrome, a test
 server on that port would find the *real* extension connecting and drive your
 actual tabs. `harness.mjs` prevents that: every isolated test runs its servers
@@ -136,6 +157,18 @@ older MCP server keeps working after the extension reloads. Reload with the
   (repeated cheap captures) around every mouse sequence. `Page.startScreencast`
   does NOT produce frames through `chrome.debugger` on such tabs, so it can't
   be used for this.
+- **Closing a tab group does NOT delete it; ungrouping does.** Chrome 129+
+  auto-saves every tab group, and `chrome.tabGroups` has no `remove`/`delete`
+  method (only get/move/query/update). So closing a group's tabs leaves a saved
+  group chip in the user's bookmarks bar, which then syncs to their account —
+  the agent thinks it cleaned up, but the trace is permanent and accumulates one
+  entry per thread. Verified empirically on Chrome 151 with A/B trials
+  (single- and multi-tab groups): `tabs.remove()` alone always left a saved
+  chip, while `tabs.ungroup()` **followed by** `tabs.remove()` left none.
+  `deleteGroup()` therefore ungroups first — the ordering is load-bearing.
+  Corollary: saved-but-closed groups are invisible to `chrome.tabGroups.query()`,
+  so the extension cannot retroactively clean up chips already leaked; those
+  must be removed by hand.
 - **`chrome.tabs.goBack/goForward` reject on background tabs** — history
   navigation is driven in-page (`history.back()`) instead.
 - **Chrome freezes/discards idle background tabs** (aggressively in collapsed

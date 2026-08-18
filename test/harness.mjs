@@ -19,14 +19,33 @@ export const root = join(here, "..");
 
 export const TEST_PORT = Number(process.env.CHROME_AGENT_TEST_PORT || 47999);
 
+// Newer Chrome for Testing builds also stopped honouring --load-extension, so
+// prefer the NEWEST build that still loads an unpacked extension rather than
+// simply the newest installed one (which would silently run every test against
+// a browser with no extension at all).
+const MAX_LOAD_EXTENSION_MAJOR = Number(process.env.CHROME_AGENT_TEST_CHROME_MAJOR || 136);
+
+function majorOf(path) {
+  const m = path.match(/mac_arm-(\d+)\./) || path.match(/mac-(\d+)\./);
+  return m ? Number(m[1]) : 0;
+}
+
 export function findChrome() {
   const cft = globSync(
     join(here, "browsers", "chrome", "*", "chrome-mac-*", "Google Chrome for Testing.app", "Contents", "MacOS", "Google Chrome for Testing")
   );
-  if (cft.length) return cft.sort().at(-1);
+  if (!cft.length) {
+    throw new Error(
+      `Chrome for Testing not found. Run:\n  npx @puppeteer/browsers install chrome@${MAX_LOAD_EXTENSION_MAJOR} --path ./browsers\n` +
+      "(Chrome >=137 ignores --load-extension, and tests must never load into your real browser.)"
+    );
+  }
+  const usable = cft.filter((p) => majorOf(p) <= MAX_LOAD_EXTENSION_MAJOR).sort((a, b) => majorOf(a) - majorOf(b));
+  if (usable.length) return usable.at(-1);
   throw new Error(
-    "Chrome for Testing not found. Run:\n  npx @puppeteer/browsers install chrome@stable --path ./browsers\n" +
-    "(Branded Chrome >=137 ignores --load-extension, and tests must never load into your real browser.)"
+    `Only Chrome >=${MAX_LOAD_EXTENSION_MAJOR + 1} is installed, and those builds ignore --load-extension ` +
+    `(the extension would never connect, so every test would fail misleadingly). Install a usable build:\n` +
+    `  npx @puppeteer/browsers install chrome@${MAX_LOAD_EXTENSION_MAJOR} --path ./browsers`
   );
 }
 

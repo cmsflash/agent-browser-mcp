@@ -8,6 +8,10 @@
 
 const STORAGE_KEY = "agentGroups";
 
+// A thread's group is reclaimed after this long without any interaction.
+// Recorded on every command (see touchThread) so an active thread never expires.
+export const THREAD_TTL_MS = 24 * 60 * 60 * 1000;
+
 // chrome.tabs.group / chrome.tabGroups.update throw "Tabs cannot be edited
 // right now (user may be dragging a tab)" while any tab-strip gesture or
 // animation is in flight — retry briefly instead of failing the tool call.
@@ -82,15 +86,12 @@ async function findByTitleColor(entry) {
   }
 }
 
-async function targetWindowId() {
-  // Prefer the last-focused normal window; never create or focus windows.
-  try {
-    const w = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
-    if (w && w.id != null) return w.id;
-  } catch (_) {}
-  const wins = await chrome.windows.getAll({ windowTypes: ["normal"] });
-  if (!wins.length) throw new Error("No normal Chrome window is open.");
-  return wins[0].id;
+// Each agent group gets its own background window: never focused, never mixed
+// with the user's tabs.
+async function acquireWindow(url) {
+  const win = await chrome.windows.create({ url, focused: false, width: 1280, height: 900 });
+  const tab = win.tabs?.[0] || (await chrome.tabs.query({ windowId: win.id }))[0];
+  return { windowId: win.id, tab };
 }
 
 async function snapshotTabs(chromeGroupId) {
@@ -102,7 +103,7 @@ async function snapshotTabs(chromeGroupId) {
   }
 }
 
-export async function createGroup({ name, color, url, window: windowMode = "separate" }) {
+export async function createGroup({ name, color, url, threadTitle }) {
   if (!name) throw new Error("name is required");
   if (color !== undefined && !COLORS.includes(color)) {
     throw new Error(`invalid color "${color}" — use one of: ${COLORS.join(", ")}`);
@@ -111,28 +112,9 @@ export async function createGroup({ name, color, url, window: windowMode = "sepa
   const id = genId();
   const chosenColor = color || COLORS[1 + (Object.keys(existing).length % (COLORS.length - 1))];
 
-  let windowId;
-  let tab;
-  if (windowMode === "separate") {
-    // Own background window (matches the official claude-in-chrome model):
-    // never steals focus, keeps the user's window clean, and makes
-    // resize_window safe (no user tabs share the window).
-    const win = await chrome.windows.create({
-      url: url || "about:blank",
-      focused: false,
-      width: 1280,
-      height: 900,
-    });
-    windowId = win.id;
-    tab = win.tabs?.[0] || (await chrome.tabs.query({ windowId }))[0];
-  } else {
-    windowId = await targetWindowId();
-    tab = await chrome.tabs.create({ url: url || "about:blank", active: false, windowId });
-  }
+  const { windowId, tab } = await acquireWindow(url || "about:blank");
   const chromeGroupId = await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } }));
-  // Collapse only when sharing the user's window; in a dedicated window an
-  // expanded group is more useful (and collapse invites tab freezing).
-  await tabEditRetry(() => chrome.tabGroups.update(chromeGroupId, { title: name, color: chosenColor, collapsed: windowMode !== "separate" }));
+  await tabEditRetry(() => chrome.tabGroups.update(chromeGroupId, { title: name, color: chosenColor, collapsed: false }));
 
   await mutateRegistry((reg) => {
     reg[id] = {
@@ -141,6 +123,7 @@ export async function createGroup({ name, color, url, window: windowMode = "sepa
       color: chosenColor,
       chromeGroupId,
       windowId,
+      ...(threadTitle ? { threadTitle } : {}),
       createdAt: Date.now(),
       lastSeenAt: Date.now(),
       tabSnapshot: [{ url: url || "about:blank", title: "" }],
@@ -149,13 +132,98 @@ export async function createGroup({ name, color, url, window: windowMode = "sepa
   return { groupId: id, chromeGroupId, name, color: chosenColor, tabId: tab.id, windowId };
 }
 
+// ---------- thread identity ----------
+// A thread is identified by the threadTitle it passes on every command. The
+// mapping threadTitle -> group is owned here, so an agent can never name,
+// enumerate, or switch groups: it only ever says who it is.
+
+function normalizeThread(threadTitle) {
+  const t = String(threadTitle ?? "").trim();
+  if (!t) throw new Error("threadTitle is required — pass the title of the agent thread making this call.");
+  return t.slice(0, 60);
+}
+
+// The registry is keyed by internal group id, so find the entry claimed by
+// this thread. Case-insensitive so trivial retitling doesn't orphan a group.
+function findThreadEntry(reg, thread) {
+  const key = thread.toLowerCase();
+  return Object.values(reg).find((e) => (e.threadTitle || "").toLowerCase() === key) || null;
+}
+
+// Resolve (or lazily create) THE group belonging to this thread. Every
+// tab-touching command funnels through here, which is what makes one group
+// per thread an invariant rather than a suggestion.
+export async function groupForThread(threadTitle, { create = true } = {}) {
+  const thread = normalizeThread(threadTitle);
+  const reg = await loadRegistry();
+  const entry = findThreadEntry(reg, thread);
+
+  if (entry) {
+    const { live } = await resolveGroup(entry.id);
+    if (live) {
+      await touchThread(entry.id);
+      return { groupId: entry.id, chromeGroupId: live.id, windowId: live.windowId, name: entry.name, created: false };
+    }
+    // The window was closed (by the user, or a crash) while the thread lives
+    // on. Reuse the SAME record so the thread keeps its identity. Callers that
+    // opted out of creation still get the record, so cleanup can finish the job.
+    if (!create) return { groupId: entry.id, chromeGroupId: null, windowId: null, name: entry.name, live: false };
+    const revived = await recreateGroupWindow(entry);
+    return { ...revived, created: true, revived: true };
+  }
+
+  if (!create) return null;
+  const made = await createGroup({ name: thread, threadTitle: thread });
+  return { groupId: made.groupId, chromeGroupId: made.chromeGroupId, windowId: made.windowId, name: made.name, created: true };
+}
+
+// Rebuild a live group for an existing registry entry, keeping its id. The
+// group's old window is gone, so this re-homes it in whatever window is
+// current now — not necessarily the one it lived in before.
+async function recreateGroupWindow(entry) {
+  const { windowId, tab } = await acquireWindow("about:blank");
+  const chromeGroupId = await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } }));
+  await tabEditRetry(() => chrome.tabGroups.update(chromeGroupId, { title: entry.name, color: entry.color, collapsed: false }));
+  await mutateRegistry((reg) => {
+    if (reg[entry.id]) {
+      reg[entry.id].chromeGroupId = chromeGroupId;
+      reg[entry.id].windowId = windowId;
+      reg[entry.id].lastSeenAt = Date.now();
+    }
+  });
+  return { groupId: entry.id, chromeGroupId, windowId, name: entry.name, tabId: tab.id };
+}
+
+// Record interaction so an active thread's group is never garbage-collected.
+export async function touchThread(groupId) {
+  await mutateRegistry((reg) => {
+    if (reg[groupId]) reg[groupId].lastSeenAt = Date.now();
+  });
+}
+
+// Reclaim groups whose thread has been silent past the TTL. Runs opportunistically
+// on command dispatch (MV3 has no reliable long-lived timer) and deletes for real.
+export async function gcStaleThreads(ttlMs = THREAD_TTL_MS) {
+  const reg = await loadRegistry();
+  const cutoff = Date.now() - ttlMs;
+  const stale = Object.values(reg).filter((e) => (e.lastSeenAt ?? e.createdAt ?? 0) < cutoff);
+  const removed = [];
+  for (const entry of stale) {
+    try {
+      await deleteGroup(entry.id);
+      removed.push({ groupId: entry.id, threadTitle: entry.threadTitle, name: entry.name });
+    } catch (_) { /* keep going; a stuck entry must not block the sweep */ }
+  }
+  return removed;
+}
+
 // Resolve an internal group ID to a LIVE Chrome group, transparently
 // re-binding after a browser restart. Returns { entry, live } where live is
 // the chrome.tabGroups group or null if the group has no live counterpart.
 export async function resolveGroup(groupId, { rebind = true } = {}) {
   const reg = await loadRegistry();
   const entry = reg[groupId];
-  if (!entry) throw new Error(`Unknown group ID: ${groupId}. Use list_tab_groups to see known groups.`);
+  if (!entry) throw new Error(`Unknown group ID: ${groupId}.`);
   let live = await chromeGroupExists(entry.chromeGroupId);
   if (!live && rebind) {
     live = await findByTitleColor(entry);
@@ -173,59 +241,6 @@ export async function resolveGroup(groupId, { rebind = true } = {}) {
     }
   }
   return { entry, live };
-}
-
-export async function reconnectGroup(groupId, { restore = false } = {}) {
-  const { entry, live } = await resolveGroup(groupId);
-  if (live) {
-    const tabs = await chrome.tabs.query({ groupId: live.id });
-    await touchGroup(groupId);
-    return {
-      groupId,
-      status: "connected",
-      chromeGroupId: live.id,
-      name: entry.name,
-      color: entry.color,
-      windowId: live.windowId,
-      tabs: tabs.map(tabInfo),
-    };
-  }
-  if (!restore) {
-    return {
-      groupId,
-      status: "closed",
-      name: entry.name,
-      lastSeenAt: entry.lastSeenAt,
-      savedTabs: entry.tabSnapshot,
-      hint: "The group's tabs are gone (closed or browser restarted without session restore). Call reconnect_tab_group with restore:true to recreate it with its last-known tabs.",
-    };
-  }
-  // Recreate the group from its snapshot, in its own background window
-  // (same model as createGroup's default).
-  const urls = (entry.tabSnapshot || []).map((t) => t.url).filter((u) => /^(https?|about|file):/i.test(u));
-  if (!urls.length) urls.push("about:blank");
-  const win = await chrome.windows.create({ url: urls[0], focused: false, width: 1280, height: 900 });
-  const windowId = win.id;
-  const tabIds = [win.tabs?.[0]?.id ?? (await chrome.tabs.query({ windowId }))[0].id];
-  for (const u of urls.slice(1, 10)) {
-    const t = await chrome.tabs.create({ url: u, active: false, windowId });
-    tabIds.push(t.id);
-  }
-  const chromeGroupId = await tabEditRetry(() => chrome.tabs.group({ tabIds, createProperties: { windowId } }));
-  await tabEditRetry(() => chrome.tabGroups.update(chromeGroupId, { title: entry.name, color: entry.color, collapsed: false }));
-  await mutateRegistry((reg) => {
-    reg[groupId] = { ...entry, chromeGroupId, windowId, lastSeenAt: Date.now() };
-  });
-  const tabs = await chrome.tabs.query({ groupId: chromeGroupId });
-  return {
-    groupId,
-    status: "restored",
-    chromeGroupId,
-    name: entry.name,
-    color: entry.color,
-    windowId,
-    tabs: tabs.map(tabInfo),
-  };
 }
 
 export async function listGroups() {
@@ -251,43 +266,37 @@ export async function listGroups() {
   return { groups: out };
 }
 
-export async function updateGroup(groupId, { name, color, collapsed }) {
-  const { live } = await resolveGroup(groupId);
-  if (!live) throw new Error(`Group ${groupId} has no open tabs — reconnect with restore:true first.`);
-  if (color !== undefined && !COLORS.includes(color)) {
-    throw new Error(`invalid color "${color}" — use one of: ${COLORS.join(", ")}`);
-  }
-  const props = {};
-  if (name) props.title = name;
-  if (color) props.color = color;
-  if (collapsed !== undefined) props.collapsed = !!collapsed;
-  const updated = await tabEditRetry(() => chrome.tabGroups.update(live.id, props));
-  const final = await mutateRegistry((reg) => {
-    const e = reg[groupId];
-    if (!e) return { name: updated.title, color: updated.color };
-    if (name) e.name = name;
-    if (color) e.color = color;
-    return { name: e.name, color: e.color };
-  });
-  return { groupId, ...final, collapsed: updated.collapsed };
-}
-
-export async function closeGroup(groupId, { keepRecord = false } = {}) {
+// DELETE a group for real, leaving nothing behind.
+//
+// Chrome 129+ auto-saves every tab group, and chrome.tabGroups exposes no
+// remove/delete method — so closing a group's tabs (the obvious implementation)
+// leaves a saved-group chip in the bookmarks bar that also syncs to the user's
+// account. Verified empirically on Chrome 151: UNGROUPING the tabs first
+// dissolves the group so no saved entry survives; closing first does not.
+// Hence the order below is load-bearing, not stylistic.
+export async function deleteGroup(groupId) {
   const { live } = await resolveGroup(groupId);
   let closedTabIds = [];
+  let windowId = null;
   if (live) {
+    windowId = live.windowId;
     const tabs = await chrome.tabs.query({ groupId: live.id });
     closedTabIds = tabs.map((t) => t.id);
-    if (closedTabIds.length) await chrome.tabs.remove(closedTabIds);
-  }
-  await mutateRegistry((reg) => {
-    if (keepRecord) {
-      if (reg[groupId]) reg[groupId].lastSeenAt = Date.now();
-    } else {
-      delete reg[groupId];
+    if (closedTabIds.length) {
+      // 1. dissolve the group (kills the saved entry)
+      await tabEditRetry(() => chrome.tabs.ungroup(closedTabIds)).catch(() => {});
+      // 2. then discard the now-loose tabs
+      await chrome.tabs.remove(closedTabIds).catch(() => {});
     }
-  });
-  return { groupId, closedTabs: closedTabIds.length, closedTabIds, recordKept: keepRecord };
+  }
+  // Closing every tab of a dedicated agent window leaves Chrome to reap the
+  // window itself; if an empty shell lingers, remove it so no husk is left.
+  if (windowId != null) {
+    const remaining = await chrome.tabs.query({ windowId }).catch(() => []);
+    if (!remaining.length) await chrome.windows.remove(windowId).catch(() => {});
+  }
+  await mutateRegistry((reg) => { delete reg[groupId]; });
+  return { groupId, deleted: true, closedTabs: closedTabIds.length, closedTabIds };
 }
 
 // Keep each group's tab snapshot fresh so restore-after-restart works.

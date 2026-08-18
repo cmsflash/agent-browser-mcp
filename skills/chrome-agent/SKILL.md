@@ -1,34 +1,48 @@
 ---
 name: chrome-agent
-description: Drive the user's real Chrome in the background via the Chrome Agent Bridge MCP (mcp__chrome-agent__* tools). Use whenever a task needs web browsing, web-app interaction, scraping, or web testing in the user's logged-in browser. The tool surface is aligned with the official Claude-in-Chrome tools, plus durable reconnectable tab groups. Covers the required workflow — one tab group per agent thread, background-only driving, and when to use reading vs screenshots vs coordinates.
+description: Drive the user's real Chrome in the background via the Chrome Agent Bridge MCP (mcp__chrome-agent__* tools). Use whenever a task needs web browsing, web-app interaction, scraping, or web testing in the user's logged-in browser. Every call takes a required threadTitle identifying your private tab workspace. Covers that contract, background-only driving, cleaning up with delete_my_tabs, and when to use reading vs screenshots vs coordinates.
 ---
 
 # Driving Chrome with the Chrome Agent Bridge
 
 You have `mcp__chrome-agent__*` tools that drive the user's real, logged-in
 Chrome **in the background**: nothing you do focuses Chrome, activates the
-user's tabs, or otherwise interrupts them. Agent tab groups live in their own
-background window. The tool names and semantics mirror the official
-Claude-in-Chrome integration, so the same habits work in both.
+user's tabs, or otherwise interrupts them.
 
-## Session start — two ways to get a workspace
+Your tabs live in your own tab group **inside the window the user is already
+using** — no new window is opened. They are never activated, so the user keeps
+looking at their own tab, but your group is visible in their tab strip. Treat
+that window as shared space: don't resize it (see `set_viewport` below) and
+clean up when you're done.
 
-- **Quick (official style):** `tabs_context_mcp {createIfEmpty: true}` creates
-  an anonymous session group in a new background window with one empty tab.
-  `navigate {url}` with no tabId does this for you automatically and returns
-  the context alongside the navigation result.
-- **Durable (preferred for long-running work):** `create_tab_group {name}`
-  with a short, distinctive task name. It returns a stable internal `groupId`
-  (e.g. `grp_1a2b3c4d`) — **save it in your task notes** so you can
-  `reconnect_tab_group {groupId}` after YOU are restarted. Reconnection
-  survives browser restarts (rebinds by name/color); if the tabs are gone,
-  call it again with `restore: true` to recreate them.
+## Your workspace: threadTitle
 
-Either way: **one group per agent thread; do all browsing inside it.**
-Ungrouped tabs (`new_tab {ungrouped: true}`) and the user's own tabs
-(`list_tabs {all: true}`) are exception cases requiring the user's explicit
-ask. When finished with the browser entirely, `close_tab_group` (add
-`keepRecord: true` if the user may want you to resume later).
+**Every tool call requires `threadTitle`** — a short, stable, distinctive title
+for the task you are doing (e.g. `"Refactor auth flow"`, `"Check CI failure"`).
+Pick one at the start and pass the *same* value on every single call.
+
+That title *is* your browser identity. The bridge keeps one private tab group
+per threadTitle and creates it for you on first use, so:
+
+- You see **only your own tabs**. The user's tabs and other agents' tabs are
+  invisible and unreachable — acting on a tab outside your workspace is refused.
+- There is nothing to set up: `new_tab {url, threadTitle}` or
+  `navigate {url, threadTitle}` just works.
+- Changing your threadTitle mid-task **strands** your tabs and starts an empty
+  workspace, so keep it stable. Reusing it later (even from a restarted agent
+  or a different MCP process) re-attaches you to the same tabs.
+- You cannot create, name, list, or switch groups; the group is infrastructure
+  you do not manage.
+
+## Finishing — always clean up
+
+Call `delete_my_tabs {threadTitle}` when you are done with the browser. It
+permanently deletes your tabs **and** the group.
+
+Use it rather than closing tabs one by one: Chrome auto-saves every tab group,
+so merely closing tabs leaves a saved group in the user's bookmarks bar that
+also syncs to their account. `delete_my_tabs` ungroups first, which is what
+actually removes it. Abandoned workspaces are also reclaimed after 24h.
 
 ## Reading pages — cheapest first
 
@@ -79,10 +93,13 @@ Buffering starts when the tab is first attached (any interaction attaches).
   `export {download: true}`. Frames are captured automatically after each
   action; the GIF (with click/drag overlays + progress bar) is written to
   ~/Downloads and optionally downloaded in the browser.
-- `resize_window {width, height, tabId}` resizes the agent group's own window
-  (refuses windows containing user tabs); `set_viewport` emulates without
-  resizing. Multiple browsers: `list_connected_browsers` → `select_browser`,
-  or `switch_browser` to let the user click Connect in the one they want.
+- **Use `set_viewport` for responsive testing**, not `resize_window`. Your tabs
+  sit in the user's own window, so `resize_window` resizes the window they are
+  looking at; it is allowed (and tells you when the window is shared) but it
+  interrupts them. `set_viewport` emulates any size with no visible effect.
+- Multiple browsers: `list_connected_browsers` → `select_browser`, or
+  `switch_browser` to let the user click Connect in the one they want (these
+  three are the only tools that need no `threadTitle`).
 
 ## Etiquette & exceptions
 
@@ -97,5 +114,9 @@ Buffering starts when the tab is first attached (any interaction attaches).
 - **"extension is not connected"** → Chrome closed or extension disabled:
   ask the user to check `chrome://extensions`, then `get_status`.
 - **Stale ref** → re-run `read_page`/`find` (refs die on navigation).
-- **Group gone** → `reconnect_tab_group {groupId, restore: true}` or `list_tab_groups`.
+- **"Tab … does not belong to this thread's tab group"** → that tab is someone
+  else's. Use `tabs_context_mcp` to list your own, and check you are passing the
+  same `threadTitle` as before.
+- **Your tabs seem to have vanished** → usually a changed `threadTitle`; pass
+  the original one. If the user closed the window, just open a tab again.
 - **After updating extension code** → `reload_extension` applies it in place.

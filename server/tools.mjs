@@ -5,18 +5,35 @@
 // semantics — see reference/alignment-map.md). On top of that, chrome-agent
 // keeps its durable tab-group layer and a few power tools as extensions.
 //
-// Design contract (unchanged):
-//   * DEFAULT: one tab group per agent thread, background-only driving.
-//   * Ungrouped tabs and the user's own tabs are the EXCEPTION.
+// Design contract:
+//   * ENFORCED: exactly one tab group per agent thread. Every tool takes a
+//     required threadTitle; the bridge maps that to the thread's own group and
+//     refuses any tab outside it. Agents cannot create, name, list, switch, or
+//     close groups — the group is invisible infrastructure.
+//   * Background-only driving; the user's own tabs are never reachable.
 
 const T = [];
 
-function tool(name, description, properties, { required = [], method = name, timeout } = {}) {
-  T.push({ name, description, inputSchema: { type: "object", properties, required }, method, timeout });
+// Identity is a parameter rather than a property of the connection, because a
+// single MCP process may serve several agent threads (some hosts share one
+// server across sessions), and one process may be restarted mid-thread.
+const threadProp = {
+  threadTitle: {
+    type: "string",
+    description:
+      "REQUIRED on every call: the title of YOUR agent thread (a short, stable, distinctive label for the task you are working on — e.g. \"Refactor auth flow\"). This is your browser workspace identity: all your tabs live in a private group keyed to it, and you can only ever see and act on tabs in that group. Pass the SAME value on every call for the duration of the thread; changing it strands your tabs and starts a fresh workspace.",
+  },
+};
+
+// threadTitle is required everywhere except the few browser-wide utilities.
+function tool(name, description, properties, { required = [], method = name, timeout, threadless = false } = {}) {
+  const props = threadless ? properties : { ...properties, ...threadProp };
+  const req = threadless ? required : [...required, "threadTitle"];
+  T.push({ name, description, inputSchema: { type: "object", properties: props, required: req }, method, timeout });
 }
 
 const tabIdReq = (what) => ({
-  tabId: { type: "number", description: `Tab ID ${what}. Must be a tab in the current group. Use tabs_context_mcp first if you don't have a valid tab ID.` },
+  tabId: { type: "number", description: `Tab ID ${what}. Must be one of YOUR tabs. Use tabs_context_mcp to list them.` },
 });
 const tabIdOpt = {
   tabId: { type: "number", description: "Target tab ID. Defaults to the session's current tab (the last tab you created, navigated, or reconnected to)." },
@@ -34,35 +51,24 @@ const selectorProp = {
 
 tool(
   "tabs_context_mcp",
-  "Get context information about the current MCP tab group. Returns all tab IDs inside the group if it exists. CRITICAL: You must get the context at least once before using other browser automation tools so you know what tabs exist. Each new conversation should create its own new tab (using tabs_create_mcp) rather than reusing existing tabs, unless the user explicitly asks to use an existing tab.",
-  {
-    createIfEmpty: { type: "boolean", description: "Creates a new MCP tab group if none exists, creates a new Window with a new tab group containing an empty tab (which can be used for this conversation). If a MCP tab group already exists, this parameter has no effect." },
-  },
+  "List YOUR tabs — the tabs in your thread's private browser workspace. Your workspace is created automatically on your first call, so this always works. You can only see your own tabs: the user's tabs and other threads' tabs are not visible or reachable. Call this when you need your tab IDs.",
+  {},
   { method: "tabs_context", timeout: 45000 }
 );
 
 tool(
   "tabs_create_mcp",
-  "Creates a new empty tab in the MCP tab group. CRITICAL: You must get the context using tabs_context_mcp at least once before using other browser automation tools so you know what tabs exist.",
+  "Create a new empty background tab in your thread's workspace and return its tab ID.",
   {},
   { method: "tabs_create", timeout: 45000 }
 );
 
 tool(
-  "tabs_close_mcp",
-  "Close a tab in the MCP tab group by its ID. Use to clean up tabs you're done with. Only tabs in this session's group are closable; call tabs_context_mcp first to get valid IDs. If you close the group's last tab, Chrome auto-removes the group — the next tabs_context_mcp with createIfEmpty starts fresh.",
-  {
-    tabId: { type: "number", description: "The ID of the tab to close. Must be in this session's tab group. Get valid IDs from tabs_context_mcp." },
-  },
-  { required: ["tabId"], method: "tabs_close" }
-);
-
-tool(
   "navigate",
-  'Navigate to a URL, or go forward/back in browser history. tabId may be omitted for URL navigation when calling navigate STANDALONE (not inside browser_batch): tabs_context_mcp{createIfEmpty:true} is called for you and the first tab in the session\'s group is navigated — its result is appended to this call\'s output so you have the tab list and ids for subsequent calls. Inside browser_batch, navigate (and other tools that act on a page) requires an explicit tabId. Pass an explicit tabId when you need a specific tab or when the session\'s group has multiple tabs whose state you must preserve. tabId is required for url:"back"/"forward". Also accepts "reload" (chrome-agent extension).',
+  `Navigate to a URL, or go forward/back in browser history. tabId may be omitted for URL navigation when calling navigate STANDALONE (not inside browser_batch): your workspace's first tab is used (the workspace is created if you don't have one yet), and the tab list is appended to this call's output so you have ids for subsequent calls. Inside browser_batch, navigate (and other tools that act on a page) requires an explicit tabId. tabId is required for url:"back"/"forward". Also accepts "reload".`,
   {
     url: { type: "string", description: 'The URL to navigate to. Can be provided with or without protocol (defaults to https://). Use "forward" to go forward in history or "back" to go back in history.' },
-    tabId: { type: "number", description: 'Tab ID to navigate. Must be a tab in the current group. If omitted for URL navigation when calling navigate standalone, tabs_context_mcp{createIfEmpty:true} is called for you. Required for url:"back"/"forward" and for navigate (and other tools that act on a page) inside browser_batch.' },
+    tabId: { type: "number", description: `Tab ID to navigate. Must be one of your own tabs. If omitted for URL navigation when calling navigate standalone, your workspace's first tab is used. Required for url:"back"/"forward" and inside browser_batch.` },
   },
   { required: ["url"], timeout: 45000 }
 );
@@ -196,7 +202,7 @@ tool(
 
 tool(
   "gif_creator",
-  "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to the tab's group. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, set 'download: true' to download the GIF in the browser; the GIF is also always written to ~/Downloads on this machine.",
+  "Manage GIF recording and export for browser automation sessions. Control when to start/stop recording browser actions (clicks, scrolls, navigation), then export as an animated GIF with visual overlays (click indicators, action labels, progress bar, watermark). All operations are scoped to your own workspace. When starting recording, take a screenshot immediately after to capture the initial state as the first frame. When stopping recording, take a screenshot immediately before to capture the final state as the last frame. For export, set 'download: true' to download the GIF in the browser; the GIF is also always written to ~/Downloads on this machine.",
   {
     action: { type: "string", enum: ["start_recording", "stop_recording", "export", "clear"], description: "Action to perform: 'start_recording' (begin capturing), 'stop_recording' (stop capturing but keep frames), 'export' (generate and export GIF), 'clear' (discard frames)" },
     download: { type: "boolean", description: "Always set this to true for the 'export' action only. This causes the gif to be downloaded in the browser." },
@@ -214,7 +220,7 @@ tool(
       },
       additionalProperties: true,
     },
-    tabId: { type: "number", description: "Tab ID to identify which tab group this operation applies to" },
+    tabId: { type: "number", description: "One of your tab IDs (identifies your workspace)" },
   },
   { required: ["action", "tabId"], timeout: 120000 }
 );
@@ -246,7 +252,7 @@ tool(
 
 tool(
   "resize_window",
-  "Resize the current browser window to specified dimensions. Useful for testing responsive designs or setting up specific screen sizes. Only works when every tab in the window is agent-managed (true for groups created by tabs_context_mcp or create_tab_group's default separate window) — refuses to resize a window containing the user's own tabs. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
+  "Resize the real browser window your tabs live in. NOTE: that is normally the user's own window, so they will see it change size. Prefer set_viewport, which emulates a viewport size for responsive testing without touching the window; use this only when a real window resize is genuinely required.",
   {
     width: { type: "number", description: "Target window width in pixels" },
     height: { type: "number", description: "Target window height in pixels" },
@@ -259,21 +265,21 @@ tool(
   "list_connected_browsers",
   "List all Chrome browsers (extension instances) currently connected to this bridge. Returns each browser's deviceId, display name, OS platform, and connection info. Use this before select_browser to present choices to the user.",
   {},
-  { method: "hub:list_browsers" }
+  { method: "hub:list_browsers", threadless: true }
 );
 
 tool(
   "select_browser",
   "Select a specific Chrome browser by deviceId for browser automation, without broadcasting a pairing request. Use this after list_connected_browsers when the user has chosen one from the list.",
   { deviceId: { type: "string", description: "The deviceId from list_connected_browsers." } },
-  { required: ["deviceId"], method: "hub:select_browser" }
+  { required: ["deviceId"], method: "hub:select_browser", threadless: true }
 );
 
 tool(
   "switch_browser",
   "Send a connection request to every Chrome browser with the extension installed and wait (up to 2 minutes) for the user to click 'Connect' in the one they want to use (extension icon → Connect). Use this when the user wants to pick the browser themselves from inside Chrome rather than choosing from a list; otherwise prefer select_browser with a known deviceId. Auto-selects immediately when only one browser is connected.",
   {},
-  { method: "hub:switch_browser", timeout: 130000 }
+  { method: "hub:switch_browser", timeout: 130000, threadless: true }
 );
 
 tool(
@@ -300,91 +306,43 @@ tool(
 
 tool(
   "get_status",
-  "Health check: is the Chrome extension connected, which browser is selected, and which agent tab groups exist. Call this first if other tools fail.",
+  "Health check: is the Chrome extension connected, and which browser is selected. Call this first if other tools fail.",
   {},
-  { method: "status" }
+  { method: "status", threadless: true }
 );
 
 tool(
-  "create_tab_group",
-  "Create a new NAMED agent tab group — the isolated workspace for THIS agent thread. Returns a stable internal groupId (e.g. 'grp_1a2b3c4d'): SAVE IT so you can reconnect later with reconnect_tab_group, even after the agent or browser restarts. Unlike tabs_context_mcp (anonymous session group), named groups are meant for long-running work. Created in a separate background window by default.",
-  {
-    name: { type: "string", description: "Short human-readable name shown on the group in Chrome. Also used to recover the group after a browser restart, so make it distinctive." },
-    color: { type: "string", enum: ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"], description: "Group color (default: auto)." },
-    url: { type: "string", description: "URL for the group's first tab (default: about:blank)." },
-    window: { type: "string", enum: ["separate", "current"], description: "'separate' (default): own background window — enables resize_window, keeps the user's window clean. 'current': the user's last-focused window." },
-  },
-  { required: ["name"], timeout: 45000 }
-);
-
-tool(
-  "list_tab_groups",
-  "List all agent-managed tab groups (open and closed), with their internal groupIds, live tabs, and — for closed groups — the saved tab snapshot they can be restored from.",
+  "delete_my_tabs",
+  "Clean up completely: permanently DELETE your thread's browser workspace — every tab you opened, plus the tab group itself. Call this when you are finished with the browser. This is a true delete, not a close: Chrome auto-saves closed tab groups, so merely closing your tabs would leave a saved group behind in the user's bookmarks bar and sync it to their account. Nothing is recoverable afterwards; a later call simply starts a fresh workspace. Abandoned workspaces are also deleted automatically after 24h without activity.",
   {}
 );
 
 tool(
-  "reconnect_tab_group",
-  "Reconnect to a previously created tab group by its internal groupId. Handles browser restarts transparently (re-binds by group name/color). If the group's tabs are gone, returns status 'closed' with the saved tabs; call again with restore:true to recreate the group and reopen them. Sets the session's current group/tab.",
-  {
-    groupId: { type: "string", description: "Internal group ID from create_tab_group, e.g. 'grp_1a2b3c4d'." },
-    restore: { type: "boolean", description: "If the group is closed, recreate it from its last-known tabs (default false)." },
-  },
-  { required: ["groupId"], timeout: 60000 }
-);
-
-tool(
-  "update_tab_group",
-  "Rename, recolor, or collapse/expand an agent tab group.",
-  {
-    groupId: { type: "string" },
-    name: { type: "string" },
-    color: { type: "string", enum: ["grey", "blue", "red", "yellow", "green", "pink", "purple", "cyan", "orange"] },
-    collapsed: { type: "boolean" },
-  },
-  { required: ["groupId"] }
-);
-
-tool(
-  "close_tab_group",
-  "Close an agent tab group: closes all its tabs and (by default) deletes its record — call this when the agent is completely done with the browser. Pass keepRecord:true to keep the saved snapshot so the group can be restored later with reconnect_tab_group restore:true.",
-  {
-    groupId: { type: "string" },
-    keepRecord: { type: "boolean", description: "Keep the registry record + tab snapshot for later restore (default false = forget the group entirely)." },
-  },
-  { required: ["groupId"] }
-);
-
-tool(
   "new_tab",
-  "Open a new BACKGROUND tab inside an agent tab group (pass groupId; defaults to the session's current group). Sets the session's current tab. EXCEPTION CASE: creating a tab outside any group requires ungrouped:true — only do that if the user explicitly asked for a loose tab, because ungrouped tabs mix with the user's own tabs.",
+  "Open a new BACKGROUND tab in your thread's workspace. It is never activated and never steals focus, so the user keeps looking at whatever tab they were on — but it does live in their current window, inside your own tab group.",
   {
     url: { type: "string", description: "URL to open (https:// assumed if no scheme). Default: about:blank." },
-    groupId: { type: "string", description: "Agent group to put the tab in. Defaults to the session's current group." },
-    ungrouped: { type: "boolean", description: "EXCEPTION: create the tab outside any group, among the user's tabs. Requires explicit user intent." },
   },
   { timeout: 45000 }
 );
 
 tool(
   "list_tabs",
-  "List tabs in an agent group (default: the session's current group). Pass all:true to list EVERY tab in the browser including the user's own — read-only awareness; do not interact with unmanaged tabs unless the user explicitly asked. all:true takes precedence over groupId.",
-  {
-    groupId: { type: "string" },
-    all: { type: "boolean" },
-  }
+  "List the tabs in your thread's workspace (same as tabs_context_mcp).",
+  {},
+  { method: "tabs_context" }
 );
 
 tool(
   "close_tab",
-  "Close a tab by ID — works on any agent tab, including ungrouped ones (tabs_close_mcp is the session-group-strict variant). tabId is always required here (never inherited from the session) — closing is destructive.",
+  "Close ONE of your own tabs by ID. The tab must be in your thread's workspace. To discard the whole workspace when you are done, use delete_my_tabs.",
   { tabId: { type: "number" } },
   { required: ["tabId"] }
 );
 
 tool(
   "bring_to_foreground",
-  "EXCEPTION CASE: activate a tab and focus its Chrome window, interrupting the user. Only use when the user explicitly asked to see the page (e.g. to log in or solve a CAPTCHA themselves).",
+  "EXCEPTION CASE: activate one of your tabs and focus its Chrome window, interrupting the user. Only use when the user explicitly asked to see the page (e.g. to log in or solve a CAPTCHA themselves).",
   { ...tabIdOpt }
 );
 
@@ -481,7 +439,7 @@ tool(
   "reload_extension",
   "Reload the Chrome Agent Bridge extension itself (applies extension code updates without touching Chrome's UI). The bridge reconnects automatically within a few seconds.",
   {},
-  { method: "reload_self" }
+  { method: "reload_self", threadless: true }
 );
 
 export const TOOLS = T;

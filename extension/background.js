@@ -6,7 +6,7 @@
 // and the hub pings every 20s.
 
 import { handle } from "./lib/dispatch.js";
-import { scheduleSnapshots } from "./lib/groups.js";
+import { scheduleSnapshots, listGroups, deleteGroup } from "./lib/groups.js";
 
 const WS_URL = "ws://127.0.0.1:47120/ext";
 
@@ -172,9 +172,11 @@ chrome.tabGroups.onUpdated.addListener(() => scheduleSnapshots());
 chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg === "status") {
     (async () => {
+      // The popup is the USER's surface, so it sees every thread's group —
+      // unlike agents, which are scoped to their own.
       let groups = [];
       try {
-        const res = await handle("list_tab_groups", {});
+        const res = await listGroups();
         groups = res.groups;
       } catch (_) {}
       reply({
@@ -200,7 +202,7 @@ chrome.runtime.onMessage.addListener((msg, _sender, reply) => {
   if (msg && msg.type === "closeGroup") {
     (async () => {
       try {
-        const res = await handle("close_tab_group", { groupId: msg.groupId });
+        const res = await deleteGroup(msg.groupId);
         reply({ ok: true, res });
       } catch (e) {
         reply({ ok: false, error: String(e.message || e) });

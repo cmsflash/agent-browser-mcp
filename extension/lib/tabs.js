@@ -2,80 +2,38 @@
 // tabs are created with active:false and windows are never focused.
 // The only exception is the explicit bring_to_foreground tool.
 
-import { resolveGroup, touchGroup, groupForTab, tabInfo, scheduleSnapshots, createGroup, tabEditRetry } from "./groups.js";
+import { resolveGroup, touchGroup, groupForTab, tabInfo, scheduleSnapshots, tabEditRetry } from "./groups.js";
 import { detach, wakeTab } from "./cdp.js";
 import { exec } from "./reading.js";
 
-// ---------- official claude-in-chrome tab model ----------
-// The "MCP tab group" of a session is simply its current agent group. These
-// methods receive the session's internal groupId from the server (injected
-// into params), so the extension itself stays session-agnostic.
+// ---------- tab model ----------
+// Every tab operation is scoped to the calling thread's own group. The
+// dispatcher resolves that group from the required threadTitle and injects it
+// as groupId, so these functions never decide WHICH group they act on.
 
-export async function tabsContext({ groupId, createIfEmpty = false }) {
-  if (groupId) {
-    const { entry, live } = await resolveGroup(groupId).catch(() => ({ entry: null, live: null }));
-    if (live) {
-      const tabs = await chrome.tabs.query({ groupId: live.id });
-      return {
-        groupId,
-        chromeGroupId: live.id,
-        windowId: live.windowId,
-        name: entry.name,
-        tabs: tabs.map(tabInfo),
-        note: "Use tabs_create_mcp for a fresh tab rather than reusing existing ones, unless the user asked otherwise.",
-      };
-    }
-  }
-  if (!createIfEmpty) {
-    return {
-      groupId: null,
-      tabs: [],
-      note: "No MCP tab group exists for this session. Call tabs_context_mcp with createIfEmpty:true (or create_tab_group for a named group).",
-    };
-  }
-  // official behavior: new window with a new group containing one empty tab
-  const suffix = Math.random().toString(36).slice(2, 6);
-  const created = await createGroup({ name: `Agent ${suffix}`, window: "separate" });
-  const tabs = await chrome.tabs.query({ groupId: created.chromeGroupId });
-  return {
-    groupId: created.groupId,
-    chromeGroupId: created.chromeGroupId,
-    windowId: created.windowId,
-    name: created.name,
-    created: true,
-    tabs: tabs.map(tabInfo),
-  };
+export async function tabsContext({ groupId }) {
+  const { entry, live } = await resolveGroup(groupId).catch(() => ({ entry: null, live: null }));
+  if (!live) return { tabs: [], note: "This thread's tab group has no live window; create a tab to get one." };
+  const tabs = await chrome.tabs.query({ groupId: live.id });
+  return { windowId: live.windowId, name: entry.name, tabs: tabs.map(tabInfo) };
 }
 
 export async function tabsCreate({ groupId }) {
-  if (!groupId) {
-    const ctx = await tabsContext({ createIfEmpty: true });
-    return { ...ctx.tabs[0], agentGroupId: ctx.groupId, context: ctx };
-  }
   return newTab({ groupId, url: "about:blank" });
 }
 
-export async function tabsClose({ tabId, groupId }) {
-  if (tabId == null) throw new Error("tabId is required");
-  if (!groupId) throw new Error("This session has no MCP tab group — tabs_close_mcp only closes tabs in the session's group. Use close_tab for other agent tabs.");
-  const { live } = await resolveGroup(groupId);
-  const t = await chrome.tabs.get(tabId).catch(() => null);
-  if (!t) return { closed: false, reason: "tab does not exist" };
-  if (!live || t.groupId !== live.id) {
-    throw new Error(`Tab ${tabId} is not in this session's tab group — tabs_close_mcp only closes the session's own tabs. Use close_tab if you really mean another agent tab.`);
-  }
-  return closeTab({ tabId });
-}
-
-export async function resizeWindow({ tabId, width, height }) {
+// Resizes the real window the agent's tabs live in — which is now normally the
+// user's own window, shared with their tabs. Kept unguarded deliberately, so
+// the caller is responsible for preferring set_viewport (which emulates a size
+// without touching the window) unless a real resize is actually required.
+export async function resizeWindow({ tabId, width, height, groupId }) {
   if (!width || !height) throw new Error("width and height are required");
-  const t = await chrome.tabs.get(tabId).catch(() => null);
-  if (!t) throw new Error(`Tab ${tabId} does not exist.`);
+  const t = await assertTabInGroup(tabId, groupId);
   const winTabs = await chrome.tabs.query({ windowId: t.windowId });
   for (const wt of winTabs) {
     if (!(await groupForTab(wt))) {
       throw new Error(
-        "Refusing to resize: this window contains tabs that are not agent-managed (likely the user's own). Use a group created by tabs_context_mcp or create_tab_group (default separate window), or set_viewport for emulation."
+        "Refusing to resize: this window contains tabs that are not agent-managed (likely the user's own). Use set_viewport for emulation instead."
       );
     }
   }
@@ -114,70 +72,53 @@ function normalizeUrl(url) {
   return url;
 }
 
-export async function newTab({ url, groupId, ungrouped = false }) {
-  if (!groupId && !ungrouped) {
-    throw new Error(
-      "new_tab requires groupId (the agent's tab group). Creating tabs OUTSIDE a group is the exception case — pass ungrouped:true only if the user explicitly asked for a loose tab."
-    );
-  }
-  let windowId;
-  let chromeGroupId = null;
-  if (groupId) {
-    const { entry, live } = await resolveGroup(groupId);
-    if (!live) {
-      throw new Error(
-        `Group ${groupId} ("${entry.name}") has no open tabs. Call reconnect_tab_group with restore:true first.`
-      );
-    }
-    windowId = live.windowId;
-    chromeGroupId = live.id;
-  }
+export async function newTab({ url, groupId }) {
+  if (!groupId) throw new Error("no tab group for this thread — internal error: the group should have been resolved from threadTitle.");
+  const { live } = await resolveGroup(groupId);
+  if (!live) throw new Error(`This thread's tab group has no live window (group ${groupId}).`);
   const tab = await chrome.tabs.create({
     url: url ? normalizeUrl(url) : "about:blank",
     active: false,
-    ...(windowId != null ? { windowId } : {}),
+    windowId: live.windowId,
   });
-  if (chromeGroupId != null) {
-    await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], groupId: chromeGroupId }));
-    await touchGroup(groupId);
-  }
+  await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], groupId: live.id }));
+  await touchGroup(groupId);
   if (url) await waitForLoad(tab.id);
   const t = await chrome.tabs.get(tab.id);
-  return {
-    ...tabInfo(t),
-    ...(groupId ? { agentGroupId: groupId } : { warning: "This tab is UNGROUPED — it lives among the user's own tabs. Prefer group tabs." }),
-  };
+  return tabInfo(t);
 }
 
-export async function listTabs({ groupId, all = false }) {
-  if (all) {
-    const tabs = await chrome.tabs.query({});
-    const annotated = [];
-    for (const t of tabs) {
-      const agentGroupId = await groupForTab(t);
-      annotated.push({ ...tabInfo(t), agentGroupId, managed: !!agentGroupId });
-    }
-    return {
-      tabs: annotated,
-      note: "Tabs with managed:false belong to the user. Do not interact with them unless the user explicitly asked.",
-    };
-  }
-  if (!groupId) throw new Error("Provide groupId, or all:true to list every tab (read-only awareness of the user's tabs).");
-  const { entry, live } = await resolveGroup(groupId);
-  if (!live) return { groupId, status: "closed", tabs: [], savedTabs: entry.tabSnapshot };
-  const tabs = await chrome.tabs.query({ groupId: live.id });
-  return { groupId, status: "open", tabs: tabs.map(tabInfo) };
-}
-
-export async function closeTab({ tabId }) {
-  if (tabId == null) throw new Error("tabId is required");
+// The single enforcement point for "a thread may only touch its own tabs".
+// Every tab-scoped command resolves its tabId through this, so a guessed or
+// leaked tabId from another thread (or from the user's own browsing) is refused.
+export async function assertTabInGroup(tabId, groupId) {
+  if (tabId == null) throw new Error("tabId is required.");
+  if (!groupId) throw new Error("no tab group for this thread yet — create a tab first.");
   const t = await chrome.tabs.get(tabId).catch(() => null);
-  if (!t) return { closed: false, reason: "tab does not exist" };
-  const agentGroupId = await groupForTab(t);
+  if (!t) throw new Error(`Tab ${tabId} does not exist (it may have been closed).`);
+  const { live } = await resolveGroup(groupId);
+  if (!live || t.groupId !== live.id) {
+    throw new Error(`Tab ${tabId} does not belong to this thread's tab group. You can only act on your own tabs; use list_tabs to see them.`);
+  }
+  return t;
+}
+
+// Only ever the caller's own tabs: the group is resolved from threadTitle by
+// the dispatcher, and there is no parameter to widen the scope.
+export async function listTabs({ groupId }) {
+  if (!groupId) throw new Error("no tab group for this thread yet — create a tab first.");
+  const { entry, live } = await resolveGroup(groupId);
+  if (!live) return { status: "closed", tabs: [], savedTabs: entry.tabSnapshot };
+  const tabs = await chrome.tabs.query({ groupId: live.id });
+  return { status: "open", tabs: tabs.map(tabInfo) };
+}
+
+export async function closeTab({ tabId, groupId }) {
+  await assertTabInGroup(tabId, groupId);
   await detach(tabId);
   await chrome.tabs.remove(tabId);
   scheduleSnapshots();
-  return { closed: true, wasManaged: !!agentGroupId };
+  return { closed: true, tabId };
 }
 
 export async function navigate({ tabId, url }) {
@@ -205,9 +146,8 @@ export async function navigate({ tabId, url }) {
   return { ...tabInfo(t), loaded };
 }
 
-export async function bringToForeground({ tabId }) {
-  if (tabId == null) throw new Error("tabId is required");
-  const t = await chrome.tabs.get(tabId);
+export async function bringToForeground({ tabId, groupId }) {
+  const t = await assertTabInGroup(tabId, groupId);
   await chrome.tabs.update(tabId, { active: true });
   await chrome.windows.update(t.windowId, { focused: true });
   return {
