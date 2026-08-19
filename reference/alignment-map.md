@@ -6,6 +6,19 @@ verbatim** (same names, same parameter schemas, same semantics), keep the
 durable tab-group layer as chrome-agent extensions, delete our redundant
 originals.
 
+> **Historical snapshot (v1.1.0).** The tool surface has since moved to the
+> `threadTitle` model, which removed every agent-facing tab-group tool; see
+> the README for the current list. One deliberate divergence from the official
+> MCP is called out inline below and worth stating up front:
+>
+> **Window model — divergent on purpose.** The official MCP puts the agent's
+> group in a NEW unfocused window. We instead join the profile's **last-active
+> normal window**, because even an unfocused new window is user-visible (window
+> list, Dock/taskbar, Mission Control). A window is created only when there is
+> no normal window to borrow, and only such a self-created window is ever
+> closed during cleanup. Anywhere below that says "a NEW unfocused window",
+> read: the user's current window.
+
 ## Aligned tools (22) — identical names & schemas
 
 | Tool | Implementation notes |
@@ -26,7 +39,7 @@ originals.
 | `gif_creator` | Real implementation. Extension records JPEG frames + action annotations per group (max 150 frames); overlays (click circles, drag arrows, labels, progress bar, watermark) composited in the extension via OffscreenCanvas; server encodes GIF with `gifenc` (+`fast-png` decode) and writes to ~/Downloads; `download:true` additionally triggers a browser download via `chrome.downloads`. |
 | `read_console_messages` | Renames `read_console`; official params (`pattern` required regex, `onlyErrors`, `limit` 100, `clear`). |
 | `read_network_requests` | Renames `read_network`; official params (`urlPattern` substring, `limit` 100, `clear`); buffer cleared on cross-domain navigation (aligned). |
-| `resize_window` | Resizes the real window containing the tab — **only when every tab in that window is agent-managed** (true for `tabs_context_mcp`/separate-window groups); errors with guidance otherwise. |
+| `resize_window` | Resizes the real window containing the tab. Since agent groups now live in the user's last-active window (see the window-model note above), this usually resizes a window the user is looking at: it is allowed, and flags `sharedWithUser` in the result. `set_viewport` is the non-intrusive alternative. |
 | `list_connected_browsers` | Hub now supports MULTIPLE extension connections (e.g. Chrome + Chrome Canary + another profile). Each extension sends a persistent `instanceId` + platform info on hello. |
 | `select_browser` | Per-session routing by `deviceId`. |
 | `switch_browser` | Broadcasts a pairing request: every connected extension shows a notification + a "Connect" button in its popup; first user click wins (2-minute wait, aligned). Auto-selects when only one browser is connected. |
@@ -34,8 +47,9 @@ originals.
 
 ## Kept chrome-agent extensions (18)
 
-`get_status` · `create_tab_group` (new `window:"separate"|"current"` param,
-default **separate** to match official window model) · `list_tab_groups` ·
+`get_status` · `create_tab_group` (had a `window:"separate"|"current"` param;
+removed along with the agent-facing group tools — placement is no longer a
+choice, see the window-model note above) · `list_tab_groups` ·
 `reconnect_tab_group` · `update_tab_group` · `close_tab_group` · `new_tab` ·
 `list_tabs` · `close_tab` · `screenshot` (fullPage/element/format + imageId) ·
 `set_viewport` · `click` (selector, middle button, clickCount, modifier array)

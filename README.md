@@ -55,7 +55,7 @@ Optional: launch Chrome with `--silent-debugger-extension-api` to hide the
 | A thread may only touch its own tabs | Every tab-scoped command passes through `assertTabInGroup`, which refuses any tab outside the caller's group — including the user's own tabs. `list_tabs` has no `all:true`. |
 | Cleanup leaves nothing behind | `delete_my_tabs` **ungroups before closing**, which is what actually removes the group; closing alone would leave a Chrome saved group (and sync it to the user's account). Abandoned workspaces are GC'd after 24h without activity. |
 | Identity survives process churn | `threadTitle` is a request parameter, not connection state, so it works whether the host gives each thread its own MCP process or shares one across all of them, and it survives a server restart mid-thread. |
-| Background driving | Agent groups live in their own background window (never focused), tabs are created `active:false`; input + screenshots go through CDP, which doesn't need visibility. `bring_to_foreground` is the single explicit exception. |
+| Background driving | Agent groups live in a tab group inside the profile's **last-active window** — no window is created or focused — and tabs are created `active:false`, so the user's active tab never changes. Input + screenshots go through CDP, which doesn't need visibility. `bring_to_foreground` is the single explicit exception. |
 | Text or visual page reps | `read_page` (outline + refs), `get_page_text`, `find`, `screenshot` (viewport / full-page / element, CSS-pixel-aligned with `computer` coordinates). |
 | Element / JS / coordinate interaction | `click`/`fill`/`form_input`/`drag_and_drop`/`upload_file` by ref or selector; `execute_javascript`; `computer` by coordinates. |
 | All user input primitives | left/right/middle clicks, double/triple clicks, modifier-clicks, mouse move/down/up, pointer & HTML5 drag-and-drop, wheel scrolling, full keyboard incl. chords and hold, typing, file upload. |
@@ -184,10 +184,27 @@ older MCP server keeps working after the extension reloads. Reload with the
   agent session starts, its server becomes the hub and the extension must
   notice. The backoff is capped at 3 s and `bridge.call()` waits up to 15 s for
   the link, so the first tool call of a session doesn't fail spuriously.
-- **Agent groups get their own background window** (`chrome.windows.create({focused:false})`),
-  matching the official model. Consequence: an agent tab is legitimately
-  "active" inside that window — the invariant to test is that no agent tab is
-  active in a window holding the *user's* tabs.
+- **Agent groups join the profile's last-active window; they do not create one.**
+  Even an unfocused `chrome.windows.create` is a user-visible event (a new entry
+  in the window list, the Dock/taskbar and Mission Control), so agent tabs go
+  into a collapsed-free tab group in the window the user is already using.
+  Consequences worth knowing:
+  - The testable invariant is now simply **no agent tab is ever `active`** —
+    a window has exactly one active tab, so that alone proves the user kept
+    theirs. (Previously an agent tab was legitimately active in its own window,
+    which made the invariant window-relative and much weaker.)
+  - A window is still created in one case: the profile has no *normal* window to
+    borrow (macOS keeps Chrome running with no windows; popups/PWAs are skipped
+    on purpose).
+  - **Cleanup closes tabs, not windows.** Measured on Chrome 136: removing a
+    window's last tab closes the window, so `delete_my_tabs` needs no window
+    bookkeeping. `deleteGroup` keeps an empty-window sweep as a belt-and-braces
+    fallback, gated purely on the window being empty. Tracking *which* window
+    the extension created (an earlier design) is actively unsafe: window ids are
+    recycled across restarts, so a remembered id can later name the user's window.
+  - `resize_window` therefore usually resizes a window the user is looking at.
+    It is deliberately unguarded, and flags `sharedWithUser` in its result;
+    `set_viewport` remains the non-intrusive way to test responsive layouts.
 - **`Page.captureScreenshot` can exceed a 20s CDP budget under heavy machine
   load** (a whole e2e screenshot section failed this way once). Screenshot now
   resumes the page and retries once at 45s.

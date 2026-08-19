@@ -86,9 +86,37 @@ async function findByTitleColor(entry) {
   }
 }
 
-// Each agent group gets its own background window: never focused, never mixed
-// with the user's tabs.
+// Agent tabs join the profile's last-active window rather than opening one of
+// their own: a new window is a visible, user-facing event (it takes a slot in
+// the window list, the Dock/taskbar, and Mission Control) even when it never
+// takes focus.
+//
+// Incognito and non-"normal" windows (popups, PWAs, devtools) are skipped: a
+// group placed there would be surprising, and an incognito one dies with the
+// session.
+function usableWindow(w) {
+  return !!w && w.type === "normal" && !w.incognito && w.id != null;
+}
+
+async function lastActiveWindowId() {
+  try {
+    const w = await chrome.windows.getLastFocused({ windowTypes: ["normal"] });
+    if (usableWindow(w)) return w.id;
+  } catch (_) {}
+  const wins = (await chrome.windows.getAll({ windowTypes: ["normal"] }).catch(() => [])).filter(usableWindow);
+  if (!wins.length) return null;
+  return (wins.find((w) => w.focused) || wins[wins.length - 1]).id;
+}
+
+// Where a group's first tab goes. A window is created ONLY when the profile
+// has none to borrow — on macOS Chrome outlives its last closed window, so
+// "no window at all" is a real state we must still work in.
 async function acquireWindow(url) {
+  const windowId = await lastActiveWindowId();
+  if (windowId != null) {
+    const tab = await chrome.tabs.create({ url, active: false, windowId });
+    return { windowId, tab };
+  }
   const win = await chrome.windows.create({ url, focused: false, width: 1280, height: 900 });
   const tab = win.tabs?.[0] || (await chrome.tabs.query({ windowId: win.id }))[0];
   return { windowId: win.id, tab };
@@ -289,11 +317,20 @@ export async function deleteGroup(groupId) {
       await chrome.tabs.remove(closedTabIds).catch(() => {});
     }
   }
-  // Closing every tab of a dedicated agent window leaves Chrome to reap the
-  // window itself; if an empty shell lingers, remove it so no husk is left.
+  // Belt-and-braces. Measured on Chrome 136: removing a window's last tab
+  // closes the window, so this should find nothing to do — it exists only in
+  // case some future/other build leaves an empty husk.
+  //
+  // Emptiness is deliberately the ENTIRE test. A window still holding tabs is
+  // the user's and is left alone; one holding none has nothing of theirs left
+  // to lose. Tracking which window we created would be worse than useless
+  // here: window ids are recycled across restarts, so a remembered id can name
+  // someone else's window later.
   if (windowId != null) {
-    const remaining = await chrome.tabs.query({ windowId }).catch(() => []);
-    if (!remaining.length) await chrome.windows.remove(windowId).catch(() => {});
+    // A failed query must never read as "empty" — that would authorize closing
+    // a window we know nothing about.
+    const remaining = await chrome.tabs.query({ windowId }).catch(() => null);
+    if (remaining && remaining.length === 0) await chrome.windows.remove(windowId).catch(() => {});
   }
   await mutateRegistry((reg) => { delete reg[groupId]; });
   return { groupId, deleted: true, closedTabs: closedTabIds.length, closedTabIds };

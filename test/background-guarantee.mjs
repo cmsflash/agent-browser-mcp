@@ -14,6 +14,7 @@ import { readFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, extname } from "node:path";
 import { fileURLToPath } from "node:url";
+import WebSocket from "ws";
 import { root, makeTestExtension, launchChrome, serverEnv, cleanup } from "./harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -49,8 +50,18 @@ const extensionDir = makeTestExtension();  // isolated port: never touches the r
 const chrome = launchChrome({
   extensionDir,
   profileDir: profile,
-  args: ["--window-size=1000,700", "--window-position=200,200", `${BASE}/index.html`],
+  // remote-debugging is the TEST's own out-of-band view of the browser: agent
+  // tabs share the user's window now, so "which tab is active" must be read
+  // from Chrome itself, not from tools that only see the agent's own tabs.
+  args: ["--remote-debugging-port=9447", "--window-size=1000,700", "--window-position=200,200", `${BASE}/index.html`],
 });
+
+// The user's own page targets, observed out-of-band (the agent's tools can
+// only ever see the agent's own tabs).
+async function userPages(excludeUrls = new Set()) {
+  const targets = await (await fetch("http://127.0.0.1:9447/json/list")).json();
+  return targets.filter((x) => x.type === "page" && !excludeUrls.has(x.url));
+}
 await sleep(2500);
 console.log("frontmost after launch:", frontApp(), "(launch itself may focus — that's the OS, not the agent)");
 
@@ -72,12 +83,28 @@ const call = async (name, args = {}) => {
   return { isError: !!r.isError, json: t ? (() => { try { return JSON.parse(t.text); } catch { return { _raw: t.text }; } })() : null };
 };
 
+const THREAD = "bg guarantee";
+// Every tool call carries the thread identity; the group is implicit.
+const t = (name, args = {}) => call(name, { threadTitle: THREAD, ...args });
+
 let ok = true;
 for (let i = 0; i < 25; i++) { const s = await call("get_status"); if (!s.isError && s.json?.connected) break; await sleep(1000); }
 
+// Record the user's pre-existing tabs BEFORE the agent does anything: agent
+// tabs now share this window, so these must survive it untouched.
+const userPagesBefore = await userPages();
+console.log("user's pages before:", userPagesBefore.map((p) => p.url).join(", "));
+// Precondition for the "no agent tab is active" assertion below: a borrowable
+// window exists, so the agent shares it instead of creating its own (where its
+// tab would necessarily be that window's active one).
+if (!userPagesBefore.length) {
+  console.log("❌ FAIL: no user window to borrow — the focus assertion would be vacuous");
+  process.exit(1);
+}
+
 console.log("\ndriving agent action battery…");
-const g = (await call("create_tab_group", { name: "BG Guarantee", url: `${BASE}/index.html` })).json;
-const tab = g.tabId;
+const first = (await t("new_tab", { url: `${BASE}/index.html` })).json;
+const tab = first.tabId;
 const battery = [
   ["new_tab", { url: `${BASE}/second.html` }],
   ["navigate", { tabId: tab, url: `${BASE}/second.html` }],
@@ -95,31 +122,46 @@ const battery = [
   ["wait_for", { tabId: tab, selector: "body", timeoutMs: 2000 }],
 ];
 for (const [name, args] of battery) {
-  const r = await call(name, args);
+  const r = await t(name, args);
   if (r.isError) { console.log(`  ⚠ ${name} errored: ${JSON.stringify(r.json).slice(0, 120)}`); }
   else process.stdout.write(`  ${name} ✓\n`);
 }
 
-// verify in-browser state: user's original tab still active
-const allTabs = (await call("list_tabs", { all: true })).json;
-const active = allTabs.tabs.filter((t) => t.active && !t.managed);
-// Agent groups live in their own dedicated windows, where their tab is
-// necessarily "active" within that window — the violation is an agent tab
-// becoming active in a window the USER owns (one that has unmanaged tabs).
-const userWindows = new Set(allTabs.tabs.filter((t) => !t.managed).map((t) => t.windowId));
-const agentActive = allTabs.tabs.filter((t) => t.active && t.managed && userWindows.has(t.windowId));
+// Agent tabs share the user's window, and a window has exactly ONE active tab
+// — so "no agent tab is active" is precisely the guarantee that the user's tab
+// kept the focus. This is decidable from the agent's own view of its tabs.
+const agentTabs = (await t("list_tabs")).json.tabs || [];
+const agentActive = agentTabs.filter((x) => x.active);
+const agentWindows = new Set(agentTabs.map((x) => x.windowId));
 
-await call("close_tab_group", { groupId: g.groupId });
+// The user's own tabs must still be there afterwards.
+const urlsAfter = new Set((await userPages()).map((p) => p.url));
+const userPagesLost = userPagesBefore.filter((p) => !urlsAfter.has(p.url));
+
+await t("delete_my_tabs");
 clearInterval(sampler);
 
 const chromeSteals = samples.filter((s) => s.includes("Chrome for Testing")).length;
 console.log(`\nsamples: ${samples.length}, frontmost distribution:`, [...new Set(samples)].join(", "));
 console.log(`Chrome-for-Testing frontmost samples during battery: ${chromeSteals}`);
-console.log(`user tab still active in browser: ${active.length >= 1 && agentActive.length === 0}`);
+console.log(`agent tabs: ${agentTabs.length} in ${agentWindows.size} window(s); active among them: ${agentActive.length}`);
 
 if (chromeSteals > 0) { ok = false; console.log("❌ FAIL: agent actions brought Chrome to the foreground"); }
 else console.log("✅ PASS: Chrome never became frontmost during agent driving");
-if (agentActive.length > 0) { ok = false; console.log("❌ FAIL: an agent tab became the active tab in a user window"); }
+
+if (agentTabs.length === 0) { ok = false; console.log("❌ FAIL: agent had no tabs — the battery proved nothing"); }
+
+// The load-bearing one: agent tabs share the user's window, and a window has
+// exactly one active tab, so an inactive agent tab means the user kept theirs.
+else if (agentActive.length > 0) {
+  ok = false;
+  console.log(`❌ FAIL: an agent tab became the active tab (${agentActive.map((x) => x.url).join(", ")})`);
+} else console.log("✅ PASS: no agent tab ever became active — the user's tab kept focus");
+
+if (userPagesLost.length > 0) {
+  ok = false;
+  console.log(`❌ FAIL: the user's own tabs disappeared: ${userPagesLost.map((p) => p.url).join(", ")}`);
+} else console.log("✅ PASS: the user's own tabs survived untouched");
 
 await client.close();
 chrome.kill();

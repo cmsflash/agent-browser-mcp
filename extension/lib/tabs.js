@@ -29,20 +29,22 @@ export async function tabsCreate({ groupId }) {
 export async function resizeWindow({ tabId, width, height, groupId }) {
   if (!width || !height) throw new Error("width and height are required");
   const t = await assertTabInGroup(tabId, groupId);
-  const winTabs = await chrome.tabs.query({ windowId: t.windowId });
+  const winTabs = await chrome.tabs.query({ windowId: t.windowId }).catch(() => []);
+  let sharedWithUser = false;
   for (const wt of winTabs) {
-    if (!(await groupForTab(wt))) {
-      throw new Error(
-        "Refusing to resize: this window contains tabs that are not agent-managed (likely the user's own). Use set_viewport for emulation instead."
-      );
-    }
+    if (!(await groupForTab(wt))) { sharedWithUser = true; break; }
   }
   const win = await chrome.windows.update(t.windowId, {
     width: Math.round(width),
     height: Math.round(height),
     state: "normal",
   });
-  return { windowId: win.id, width: win.width, height: win.height };
+  return {
+    windowId: win.id,
+    width: win.width,
+    height: win.height,
+    ...(sharedWithUser ? { sharedWithUser: true, note: "This window also holds the user's own tabs — they saw it resize. Prefer set_viewport for responsive testing." } : {}),
+  };
 }
 
 export function waitForLoad(tabId, timeoutMs = 30000) {
