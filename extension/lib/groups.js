@@ -6,6 +6,8 @@
 // restarts), so we persist a mapping in chrome.storage.local and recover by
 // title+color match, or by re-creating the group from its last tab snapshot.
 
+import { normalizeUrl } from "./url.js";
+
 const STORAGE_KEY = "agentGroups";
 
 // A thread's group is reclaimed after this long without any interaction.
@@ -131,6 +133,13 @@ async function snapshotTabs(chromeGroupId) {
   }
 }
 
+// A Chrome group cannot be created empty — chrome.tabs.group needs a tab to
+// put in it — so every group is born around a seed tab. `url` is that tab's
+// destination: the caller's FIRST navigation, threaded down from the command
+// that triggered creation. Passing it here (rather than defaulting to
+// about:blank and opening the real tab separately) is what stops every new
+// workspace from stranding a blank tab. The seed's id comes back as seedTabId
+// so the caller adopts it instead of creating a second tab.
 export async function createGroup({ name, color, url, threadTitle }) {
   if (!name) throw new Error("name is required");
   if (color !== undefined && !COLORS.includes(color)) {
@@ -140,7 +149,8 @@ export async function createGroup({ name, color, url, threadTitle }) {
   const id = genId();
   const chosenColor = color || COLORS[1 + (Object.keys(existing).length % (COLORS.length - 1))];
 
-  const { windowId, tab } = await acquireWindow(url || "about:blank");
+  const seedUrl = url ? normalizeUrl(url) : "about:blank";
+  const { windowId, tab } = await acquireWindow(seedUrl);
   const chromeGroupId = await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } }));
   await tabEditRetry(() => chrome.tabGroups.update(chromeGroupId, { title: name, color: chosenColor, collapsed: false }));
 
@@ -154,10 +164,10 @@ export async function createGroup({ name, color, url, threadTitle }) {
       ...(threadTitle ? { threadTitle } : {}),
       createdAt: Date.now(),
       lastSeenAt: Date.now(),
-      tabSnapshot: [{ url: url || "about:blank", title: "" }],
+      tabSnapshot: [{ url: seedUrl, title: "" }],
     };
   });
-  return { groupId: id, chromeGroupId, name, color: chosenColor, tabId: tab.id, windowId };
+  return { groupId: id, chromeGroupId, name, color: chosenColor, tabId: tab.id, seedTabId: tab.id, windowId };
 }
 
 // ---------- thread identity ----------
@@ -181,7 +191,11 @@ function findThreadEntry(reg, thread) {
 // Resolve (or lazily create) THE group belonging to this thread. Every
 // tab-touching command funnels through here, which is what makes one group
 // per thread an invariant rather than a suggestion.
-export async function groupForThread(threadTitle, { create = true } = {}) {
+// `url` is the destination of the command that forced this group into
+// existence. It is used ONLY when a group is actually born (or revived): the
+// seed tab Chrome demands becomes the caller's real first tab, and the returned
+// seedTabId tells the caller to adopt it rather than open another.
+export async function groupForThread(threadTitle, { create = true, url } = {}) {
   const thread = normalizeThread(threadTitle);
   const reg = await loadRegistry();
   const entry = findThreadEntry(reg, thread);
@@ -196,20 +210,27 @@ export async function groupForThread(threadTitle, { create = true } = {}) {
     // on. Reuse the SAME record so the thread keeps its identity. Callers that
     // opted out of creation still get the record, so cleanup can finish the job.
     if (!create) return { groupId: entry.id, chromeGroupId: null, windowId: null, name: entry.name, live: false };
-    const revived = await recreateGroupWindow(entry);
+    const revived = await recreateGroupWindow(entry, url);
     return { ...revived, created: true, revived: true };
   }
 
   if (!create) return null;
-  const made = await createGroup({ name: thread, threadTitle: thread });
-  return { groupId: made.groupId, chromeGroupId: made.chromeGroupId, windowId: made.windowId, name: made.name, created: true };
+  const made = await createGroup({ name: thread, threadTitle: thread, url });
+  return {
+    groupId: made.groupId,
+    chromeGroupId: made.chromeGroupId,
+    windowId: made.windowId,
+    name: made.name,
+    seedTabId: made.seedTabId,
+    created: true,
+  };
 }
 
 // Rebuild a live group for an existing registry entry, keeping its id. The
 // group's old window is gone, so this re-homes it in whatever window is
 // current now — not necessarily the one it lived in before.
-async function recreateGroupWindow(entry) {
-  const { windowId, tab } = await acquireWindow("about:blank");
+async function recreateGroupWindow(entry, url) {
+  const { windowId, tab } = await acquireWindow(url ? normalizeUrl(url) : "about:blank");
   const chromeGroupId = await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], createProperties: { windowId } }));
   await tabEditRetry(() => chrome.tabGroups.update(chromeGroupId, { title: entry.name, color: entry.color, collapsed: false }));
   await mutateRegistry((reg) => {
@@ -219,7 +240,7 @@ async function recreateGroupWindow(entry) {
       reg[entry.id].lastSeenAt = Date.now();
     }
   });
-  return { groupId: entry.id, chromeGroupId, windowId, name: entry.name, tabId: tab.id };
+  return { groupId: entry.id, chromeGroupId, windowId, name: entry.name, tabId: tab.id, seedTabId: tab.id };
 }
 
 // Record interaction so an active thread's group is never garbage-collected.

@@ -222,7 +222,14 @@ export async function handle(method, params = {}) {
   // the caller's own group: there is no parameter that selects another one.
   if (!THREADLESS.has(method)) {
     void maybeGc();
-    const g = await groups.groupForThread(params.threadTitle, { create: CREATES_WORKSPACE.has(method) });
+    const creates = CREATES_WORKSPACE.has(method);
+    // Hand the destination down so a group being born opens its mandatory seed
+    // tab AT that url — the seed then IS the caller's first tab instead of a
+    // blank one stranded beside it.
+    const g = await groups.groupForThread(params.threadTitle, {
+      create: creates,
+      ...(creates ? { url: params.url } : {}),
+    });
     if (!g) {
       if (method === "delete_my_tabs") return { deleted: true, closedTabs: 0, note: "nothing to delete — this thread had no workspace" };
       if (method === "tabs_context" || method === "list_tabs") {
@@ -230,7 +237,10 @@ export async function handle(method, params = {}) {
       }
       throw new Error("You have no tabs yet — create one with tabs_create_mcp or new_tab first.");
     }
-    params = { ...params, groupId: g.groupId };
+    // seedTabId is assigned here and NOWHERE else: writing it unconditionally
+    // overwrites any client-supplied value, so a caller cannot hand us a tab id
+    // and have newTab adopt that instead of opening a fresh tab.
+    params = { ...params, groupId: g.groupId, seedTabId: g.seedTabId ?? null };
   }
 
   switch (method) {

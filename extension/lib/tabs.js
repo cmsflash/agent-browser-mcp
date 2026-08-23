@@ -5,6 +5,7 @@
 import { resolveGroup, touchGroup, groupForTab, tabInfo, scheduleSnapshots, tabEditRetry } from "./groups.js";
 import { detach, wakeTab } from "./cdp.js";
 import { exec } from "./reading.js";
+import { normalizeUrl } from "./url.js";
 
 // ---------- tab model ----------
 // Every tab operation is scoped to the calling thread's own group. The
@@ -18,8 +19,8 @@ export async function tabsContext({ groupId }) {
   return { windowId: live.windowId, name: entry.name, tabs: tabs.map(tabInfo) };
 }
 
-export async function tabsCreate({ groupId }) {
-  return newTab({ groupId, url: "about:blank" });
+export async function tabsCreate({ groupId, seedTabId }) {
+  return newTab({ groupId, seedTabId, url: "about:blank" });
 }
 
 // Resizes the real window the agent's tabs live in — which is now normally the
@@ -69,24 +70,37 @@ export function waitForLoad(tabId, timeoutMs = 30000) {
   });
 }
 
-function normalizeUrl(url) {
-  if (!/^[a-z][a-z0-9+.-]*:/i.test(url)) return "https://" + url;
-  return url;
-}
-
-export async function newTab({ url, groupId }) {
+// seedTabId is set when THIS call is what brought the group into being: the
+// group's mandatory seed tab was already opened at our url, so adopt it. Making
+// a second tab here is exactly what used to strand a blank one in every new
+// workspace. The seed is already grouped and already loading, so the only work
+// left is to await it — the return contract is identical either way.
+export async function newTab({ url, groupId, seedTabId }) {
   if (!groupId) throw new Error("no tab group for this thread — internal error: the group should have been resolved from threadTitle.");
   const { live } = await resolveGroup(groupId);
   if (!live) throw new Error(`This thread's tab group has no live window (group ${groupId}).`);
-  const tab = await chrome.tabs.create({
-    url: url ? normalizeUrl(url) : "about:blank",
-    active: false,
-    windowId: live.windowId,
-  });
-  await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], groupId: live.id }));
+
+  let tabId = seedTabId;
+  // Trust but verify: a seed that vanished or was pulled out of the group in
+  // the moment between creation and here must not silently become a no-op.
+  if (tabId != null) {
+    const seed = await chrome.tabs.get(tabId).catch(() => null);
+    if (!seed || seed.groupId !== live.id) tabId = null;
+  }
+
+  if (tabId == null) {
+    const tab = await chrome.tabs.create({
+      url: url ? normalizeUrl(url) : "about:blank",
+      active: false,
+      windowId: live.windowId,
+    });
+    await tabEditRetry(() => chrome.tabs.group({ tabIds: [tab.id], groupId: live.id }));
+    tabId = tab.id;
+  }
+
   await touchGroup(groupId);
-  if (url) await waitForLoad(tab.id);
-  const t = await chrome.tabs.get(tab.id);
+  if (url) await waitForLoad(tabId);
+  const t = await chrome.tabs.get(tabId);
   return tabInfo(t);
 }
 

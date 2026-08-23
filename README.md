@@ -113,6 +113,8 @@ npx @puppeteer/browsers install chrome@stable --path ./browsers   # once
 # isolated (throwaway browser — never touches your real Chrome)
 node e2e.mjs                    # 137-assertion full tool matrix
 node thread-isolation.mjs       # enforced one-group-per-thread + true delete
+node no-blank-tab.mjs           # a new workspace strands no blank tab
+node window-reuse.mjs           # groups land in the user's window; cleanup is safe
 node freeze-recovery.mjs        # frozen-renderer recovery
 node background-guarantee.mjs   # OS-level focus-steal check
 
