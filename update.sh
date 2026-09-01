@@ -47,13 +47,19 @@ fi
 
 echo "  hub (pid $PID) predates the code — restarting it."
 
-# The handover is a race: when the hub dies, every relay waits 250-750ms and
-# then tries to claim the port. Losing that race would hand the hub role to
-# ANOTHER long-lived process still running old code, which is exactly what we
-# are trying to get rid of. So start the replacement immediately and confirm
-# it actually won, rather than assuming.
+# SIGTERM first, but do not spawn the replacement until the port is actually
+# free. The old hub's graceful close can lag seconds behind live extension
+# sockets; a replacement spawned early just becomes a relay of the dying
+# process and silently fails to take over. Poll briefly, then force it.
 kill -TERM "$PID" 2>/dev/null || true
-sleep 0.15
+for _ in $(seq 1 12); do
+  [ -z "$(hub_pid)" ] && break
+  sleep 0.25
+done
+if [ -n "$(hub_pid)" ]; then
+  kill -9 "$PID" 2>/dev/null || true
+  sleep 0.5
+fi
 
 # stdin must stay open: index.mjs treats stdin close as "my MCP client exited"
 # and shuts down, which would silently hand the port back to an old relay.
@@ -61,12 +67,20 @@ nohup node "$ROOT/server/index.mjs" < /dev/zero > /tmp/chrome-agent-hub.log 2>&1
 NEW=$!
 sleep 2
 
+# Winning means the hub runs current code — which our spawn proves by
+# identity, but a concurrently-started fresh session proves equally well by
+# having been loaded from disk after the code's mtime.
 WINNER="$(hub_pid || true)"
-if [ "$WINNER" = "$NEW" ]; then
-  echo "✔ hub restarted on current code (pid $NEW)."
+WINNER_EPOCH="$(date -j -f "%a %b %d %T %Y" "$(ps -o lstart= -p "$WINNER" 2>/dev/null)" +%s 2>/dev/null || echo 0)"
+if [ -z "$WINNER" ]; then
+  echo "⚠ nothing is listening on $PORT — the next agent tool call will start one."
+  exit 1
+fi
+if [ "$WINNER" = "$NEW" ] || [ "$WINNER_EPOCH" -gt "$CODE_EPOCH" ]; then
+  echo "✔ hub on current code (pid $WINNER)."
 else
-  echo "⚠ another process (pid ${WINNER:-none}) claimed port $PORT first."
-  echo "  It is an older relay that won the election. Re-run this script to retry."
+  echo "⚠ pid $WINNER holds $PORT but predates the code — a relay won the"
+  echo "  election. Re-run this script; it will detect the stale hub and retry."
   exit 1
 fi
 
