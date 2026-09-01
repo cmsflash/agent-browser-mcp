@@ -1,38 +1,40 @@
 #!/usr/bin/env node
-// End-to-end test: throwaway-profile Chrome + extension + MCP clients.
+// Comprehensive end-to-end test against an isolated Chrome: the full driving
+// surface (reading, interaction, screenshots, uploads, console/network, JS
+// REPL, browser_batch, gif_creator) plus the threadTitle workspace model.
 //
-//   node e2e.mjs [--keep]   (--keep leaves Chrome running for inspection)
+//   node e2e.mjs [--keep]
 //
-// Exercises the full v1.1.0 tool matrix: the claude-in-chrome-aligned surface
-// (tabs_context/computer/read_page/find/javascript_tool/browser_batch/
-// gif_creator/upload_image/resize_window/browser selection…) plus the durable
-// tab-group layer, hub→relay failover, and the background guarantee.
+// Focused suites own the deep invariants — thread-isolation.mjs (one group
+// per thread, cross-thread refusal, delete semantics), window-reuse.mjs (the
+// window model), no-blank-tab.mjs (seed tabs), background-guarantee.mjs
+// (never frontmost). This file proves the tools work end to end and that the
+// pieces compose, including hub failover mid-suite.
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { createServer } from "node:http";
-import { readFileSync, mkdtempSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname, extname } from "node:path";
 import { fileURLToPath } from "node:url";
+import WebSocket from "ws";
 import { root, makeTestExtension, launchChrome, serverEnv, cleanup } from "./harness.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const PAGE_PORT = 8931;
+const PAGE_PORT = 8933;
+const DBG_PORT = 9448; // out-of-band observation (agent tools see only their own tabs)
 const KEEP = process.argv.includes("--keep");
-
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ---------- tiny assertion framework ----------
 let passed = 0, failed = 0;
 const failures = [];
 function check(name, cond, detail = "") {
   if (cond) { passed++; console.log(`  ✅ ${name}`); }
-  else { failed++; failures.push(name); console.log(`  ❌ ${name} ${detail ? "— " + detail : ""}`); }
+  else { failed++; failures.push(name); console.log(`  ❌ ${name}${detail ? " — " + detail : ""}`); }
 }
-function section(name) { console.log(`\n■ ${name}`); }
+function section(n) { console.log(`\n■ ${n}`); }
 
-// ---------- static test-page server ----------
 const MIME = { ".html": "text/html", ".json": "application/json" };
 const pageServer = createServer((req, res) => {
   const path = req.url.split("?")[0];
@@ -62,27 +64,62 @@ const chrome = launchChrome({
   extensionDir,
   profileDir: profile,
   args: [
+    `--remote-debugging-port=${DBG_PORT}`,
     "--window-size=1280,900",
     "--window-position=40,40",
     `${BASE}/index.html`, // this becomes the USER's tab — must stay active throughout
   ],
 });
 
+// ---------- out-of-band observation (debug port) ----------
+// Agent tools can only ever see the agent's own tabs, so window-level and
+// user-tab claims are verified from Chrome itself.
+async function cdpPages() {
+  const targets = await (await fetch(`http://127.0.0.1:${DBG_PORT}/json/list`)).json();
+  return targets.filter((t) => t.type === "page");
+}
+async function pageWindowMap() {
+  const pages = await cdpPages();
+  const version = await (await fetch(`http://127.0.0.1:${DBG_PORT}/json/version`)).json();
+  const ws = new WebSocket(version.webSocketDebuggerUrl);
+  await new Promise((r) => ws.on("open", r));
+  let id = 0;
+  const send = (method, params = {}) => new Promise((res) => {
+    const i = ++id;
+    const h = (d) => { const j = JSON.parse(d.toString()); if (j.id === i) { ws.off("message", h); res(j); } };
+    ws.on("message", h);
+    ws.send(JSON.stringify({ id: i, method, params }));
+  });
+  const out = [];
+  for (const p of pages) {
+    const r = await send("Browser.getWindowForTarget", { targetId: p.id });
+    out.push({ url: p.url, windowId: r.result?.windowId ?? null });
+  }
+  ws.close();
+  return out;
+}
+
 // ---------- MCP client helpers ----------
-async function newClient(name) {
+async function newClient(threadTitle) {
   const transport = new StdioClientTransport({
     command: "node",
     args: [join(root, "server", "index.mjs")],
     stderr: "pipe",
     env: { ...serverEnv, CHROME_AGENT_DOWNLOADS_DIR: profile },
   });
-  const client = new Client({ name, version: "1.0.0" });
+  const client = new Client({ name: threadTitle, version: "1.0.0" });
   await client.connect(transport);
+  client.threadTitle = threadTitle;
   return client;
 }
 
+// threadTitle is required on (nearly) every tool and must be STABLE per
+// thread, so it is stamped from the client rather than repeated 200 times.
 async function call(client, name, args = {}) {
-  const res = await client.callTool({ name, arguments: args });
+  const res = await client.callTool({
+    name,
+    arguments: { threadTitle: client.threadTitle, ...args },
+  });
   const textPart = (res.content || []).find((c) => c.type === "text");
   const imagePart = (res.content || []).find((c) => c.type === "image");
   let json = null;
@@ -115,42 +152,52 @@ try {
   if (!up) throw new Error("extension never connected — aborting");
 
   const status0 = (await call(client1, "get_status")).json;
-  check("get_status returns session info", status0.session?.bridgeMode === "hub");
-  check("server reports v1.1.1", status0.serverVersion === "1.1.1", JSON.stringify(status0.serverVersion));
-  check("extension reports v1.1.1", status0.extensionVersion === "1.1.1", JSON.stringify(status0.extensionVersion));
+  check("get_status returns session info", status0.session?.bridgeMode === "hub", JSON.stringify(status0.session));
+  check("server reports v1.2.0", status0.serverVersion === "1.2.0", JSON.stringify(status0.serverVersion));
+  check("extension reports v1.2.0", status0.extensionVersion === "1.2.0", JSON.stringify(status0.extensionVersion));
 
-  // remember the user's tab (the one Chrome opened at startup)
-  const allTabs0 = (await call(client1, "list_tabs", { all: true })).json;
-  const userTab = allTabs0.tabs.find((t) => t.url.includes("/index.html") && t.active);
-  check("user tab exists and is active", !!userTab);
+  await sleep(1500);
+  const userPagesBefore = await cdpPages();
+  check("user tab exists at startup", userPagesBefore.length >= 1 && userPagesBefore.some((p) => p.url.includes("/index.html")),
+    JSON.stringify(userPagesBefore.map((p) => p.url)));
 
-  // ---------------- tab groups (durable layer) ----------------
-  section("Tab groups");
-  const g1 = (await call(client1, "create_tab_group", { name: "E2E Alpha", color: "purple", url: `${BASE}/index.html` })).json;
-  check("create_tab_group returns internal id", /^grp_[0-9a-f]{8}$/.test(g1.groupId || ""), JSON.stringify(g1));
-  check("create_tab_group returns chrome group + tab", g1.chromeGroupId > 0 && g1.tabId > 0);
-  check("group lives in its own window (separate default)", g1.windowId !== userTab.windowId, `group win ${g1.windowId} vs user win ${userTab.windowId}`);
-  const groupId = g1.groupId;
-  const tabA = g1.tabId;
+  // ---------------- workspace model (threadTitle) ----------------
+  section("Workspace model");
+  // The very first tab-touching call implicitly creates this thread's
+  // workspace. No group-management tool exists for the agent to call, and
+  // with exactly ONE browser connected, no select_browser was needed either —
+  // the call above prove the single browser is adopted automatically.
+  const t1 = (await call(client1, "new_tab", { url: `${BASE}/index.html` })).json;
+  check("first new_tab implicitly creates the workspace", t1.tabId > 0 && t1.groupId > 0, JSON.stringify(t1));
+  check("new_tab is background (not active)", t1.active === false, JSON.stringify(t1));
+  const tabA = t1.tabId;
   await call(client1, "wait_for", { tabId: tabA, text: "Agent Bridge Test Page", timeoutMs: 10000 });
 
-  const groups1 = (await call(client1, "list_tab_groups")).json;
-  check("list_tab_groups shows the group open", groups1.groups.some((g) => g.groupId === groupId && g.status === "open"));
+  const winmap = await pageWindowMap();
+  const windowIds = new Set(winmap.map((p) => p.windowId));
+  check("agent tab joins the user's window (no new window)", windowIds.size === 1 && winmap.length >= 2,
+    JSON.stringify(winmap.map((p) => [p.url, p.windowId])));
+  const userWinId = [...windowIds][0];
+  check("new_tab reports the user's window id", t1.windowId === userWinId, `${t1.windowId} vs ${userWinId}`);
 
-  const upd = (await call(client1, "update_tab_group", { groupId, name: "E2E Alpha Renamed", color: "cyan" })).json;
-  check("update_tab_group renames", upd.name === "E2E Alpha Renamed");
-
-  // ---------------- tabs ----------------
-  section("Tabs");
   const t2 = (await call(client1, "new_tab", { url: `${BASE}/second.html` })).json;
-  check("new_tab defaults into session group", t2.agentGroupId === groupId, JSON.stringify(t2));
-  check("new_tab is background (not active)", t2.active === false);
+  check("second new_tab lands in the same group", t2.groupId === t1.groupId, `${t1.groupId} vs ${t2.groupId}`);
+  check("second new_tab is background", t2.active === false);
 
   const lt = (await call(client1, "list_tabs")).json;
-  check("list_tabs shows 2 tabs in group", lt.tabs?.length === 2, JSON.stringify(lt.tabs?.map((t) => t.url)));
+  check("list_tabs shows 2 tabs", (lt.tabs || []).length === 2, JSON.stringify((lt.tabs || []).map((t) => t.url)));
+
+  // a foreign tab id (the user's own tab, or a nonexistent one — either way
+  // it is outside the workspace and must be refused)
+  const mine = new Set([t1.tabId, t2.tabId]);
+  let foreignId = 1;
+  while (mine.has(foreignId)) foreignId++;
+  const closeForeign = await call(client1, "close_tab", { tabId: foreignId });
+  check("close_tab refuses a tab outside the workspace", closeForeign.isError && /does not belong|does not exist/.test(closeForeign.text),
+    closeForeign.text.slice(0, 100));
 
   const closeRes = (await call(client1, "close_tab", { tabId: t2.tabId })).json;
-  check("close_tab works", closeRes.closed === true);
+  check("close_tab works on own tab", closeRes.closed === true);
 
   const navBack = (await call(client1, "navigate", { tabId: tabA, url: `${BASE}/second.html` })).json;
   check("navigate loads second page", navBack.url.includes("second.html") && navBack.loaded);
@@ -159,10 +206,6 @@ try {
   const fwd = (await call(client1, "navigate", { tabId: tabA, url: "forward" })).json;
   check("navigate forward works", fwd.url.includes("second.html"));
   await call(client1, "navigate", { tabId: tabA, url: "back" });
-
-  const looseTab = (await call(client1, "new_tab", { ungrouped: true, url: `${BASE}/second.html` })).json;
-  check("ungrouped new_tab warns", (looseTab.warning || "").includes("UNGROUPED"), JSON.stringify(looseTab));
-  await call(client1, "close_tab", { tabId: looseTab.tabId });
 
   // ---------------- reading (aligned read_page/find) ----------------
   section("Reading");
@@ -523,10 +566,11 @@ try {
 
   // ---------------- resize_window + viewport ----------------
   section("Window & viewport");
+  // Agent tabs share the user's window, so a real resize is user-visible —
+  // the tool must still do it, but say so.
   const rw = (await call(client1, "resize_window", { tabId: tabA, width: 900, height: 700 })).json;
-  check("resize_window resizes agent window", Math.abs((rw.width ?? 0) - 900) <= 20 && Math.abs((rw.height ?? 0) - 700) <= 20, JSON.stringify(rw));
-  const rwUser = await call(client1, "resize_window", { tabId: userTab.tabId, width: 500, height: 500 });
-  check("resize_window refuses the user's window", rwUser.isError && /Refusing/.test(rwUser.text), rwUser.text?.slice(0, 120));
+  check("resize_window resizes the shared window", Math.abs((rw.width ?? 0) - 900) <= 20 && Math.abs((rw.height ?? 0) - 700) <= 20, JSON.stringify(rw));
+  check("resize_window flags the shared window", rw.sharedWithUser === true, JSON.stringify(rw));
 
   await call(client1, "set_viewport", { tabId: tabA, width: 500, height: 600 });
   await sleep(200);
@@ -551,77 +595,56 @@ try {
   const scExec = await call(client1, "shortcuts_execute", { tabId: tabA, command: "nope" });
   check("shortcuts_execute reports missing shortcut", scExec.isError && /not found/i.test(scExec.text));
 
-  // ---------------- official tab model (tabs_context / create / close) ----------------
-  section("Official tab model");
+  // ---------------- threads: isolation + shared window ----------------
+  section("Threads");
   client2 = await newClient("e2e-thread-2");
   await sleep(500);
   const st2 = (await call(client2, "get_status")).json;
-  check("client2 runs in relay mode", st2.session?.bridgeMode === "relay", JSON.stringify(st2.session));
-  check("client2 sees client1's group", (st2.groups || []).some((g) => g.groupId === groupId));
+  check("second client runs in relay mode", st2.session?.bridgeMode === "relay", JSON.stringify(st2.session));
 
-  const ctx0 = (await call(client2, "tabs_context_mcp", {})).json;
-  check("tabs_context_mcp empty session reports no group", ctx0.groupId === null && (ctx0.tabs || []).length === 0, JSON.stringify(ctx0));
+  const ctx0 = (await call(client2, "tabs_context_mcp")).json;
+  check("a fresh thread has no tabs", (ctx0.tabs || []).length === 0 && /no tabs/i.test(ctx0.note || ""), JSON.stringify(ctx0).slice(0, 120));
 
-  const ctx1 = (await call(client2, "tabs_context_mcp", { createIfEmpty: true })).json;
-  check("createIfEmpty creates group in NEW window", /^grp_/.test(ctx1.groupId || "") && ctx1.created === true && ctx1.windowId !== userTab.windowId, JSON.stringify({ g: ctx1.groupId, w: ctx1.windowId }));
-  check("new context group has one empty tab", (ctx1.tabs || []).length === 1);
-  const ctxTab = ctx1.tabs[0].tabId;
+  const c2a = (await call(client2, "tabs_create_mcp")).json;
+  check("tabs_create_mcp gives the thread its own workspace", c2a.tabId > 0 && c2a.groupId > 0, JSON.stringify(c2a));
+  const c2b = (await call(client2, "tabs_create_mcp")).json;
+  check("second create reuses the same workspace", c2b.groupId === c2a.groupId, `${c2a.groupId} vs ${c2b.groupId}`);
+  const ctx2 = (await call(client2, "tabs_context_mcp")).json;
+  check("context lists both tabs", (ctx2.tabs || []).length === 2);
+  check("both threads share the user's window", ctx2.windowId === userWinId, `${ctx2.windowId} vs ${userWinId}`);
 
-  const ctx2 = (await call(client2, "tabs_context_mcp", { createIfEmpty: true })).json;
-  check("createIfEmpty is idempotent for the session", ctx2.groupId === ctx1.groupId && !ctx2.created, JSON.stringify(ctx2.groupId));
-
-  const tc = (await call(client2, "tabs_create_mcp", {})).json;
-  check("tabs_create_mcp adds an empty tab", tc.tabId > 0 && tc.agentGroupId === ctx1.groupId, JSON.stringify(tc));
-
-  const closeForeign = await call(client2, "tabs_close_mcp", { tabId: userTab.tabId });
-  check("tabs_close_mcp refuses tabs outside the session group", closeForeign.isError && /not in this session/.test(closeForeign.text), closeForeign.text?.slice(0, 120));
-  const closeOwn = (await call(client2, "tabs_close_mcp", { tabId: tc.tabId })).json;
-  check("tabs_close_mcp closes own tab", closeOwn.closed === true);
+  const steal = await call(client2, "close_tab", { tabId: tabA });
+  check("closing another thread's tab is refused", steal.isError && /does not belong/i.test(steal.text), steal.text.slice(0, 90));
+  const closeOwn2 = (await call(client2, "close_tab", { tabId: c2b.tabId })).json;
+  check("closing own tab works", closeOwn2.closed === true);
 
   // navigate standalone with NO tab: auto-context (aligned)
   client3 = await newClient("e2e-thread-3");
   await sleep(300);
   const reloadNoTab = await call(client3, "navigate", { url: "reload" });
-  check("navigate 'reload' with no tab errors instead of creating a group", reloadNoTab.isError && /tabId is required/.test(reloadNoTab.text), reloadNoTab.text?.slice(0, 100));
+  check("navigate 'reload' with no tab errors instead of creating a workspace", reloadNoTab.isError && /tabId is required/.test(reloadNoTab.text), reloadNoTab.text?.slice(0, 100));
   const navAuto = (await call(client3, "navigate", { url: `${BASE}/second.html` })).json;
-  check("navigate standalone auto-creates context", navAuto.url?.includes("second.html") && /^grp_/.test(navAuto.context?.groupId || ""), JSON.stringify({ url: navAuto.url, ctx: navAuto.context?.groupId }));
-  const navBackErr = await call(client3, "navigate", { url: "back", tabId: undefined });
-  check("navigate back without tabId errors (aligned)", navBackErr.isError === false || navBackErr.isError === true, "informational");
-  await call(client3, "close_tab_group", { groupId: navAuto.context.groupId });
+  check("navigate standalone auto-creates a workspace", navAuto.url?.includes("second.html") && navAuto.tabId > 0,
+    JSON.stringify({ url: navAuto.url, tabId: navAuto.tabId }));
+  const ctx3 = (await call(client3, "list_tabs")).json;
+  check("the auto-created tab IS the thread's workspace",
+    (ctx3.tabs || []).length === 1 && (ctx3.tabs[0].url || "").includes("second.html"),
+    JSON.stringify(ctx3.tabs));
+  await call(client3, "delete_my_tabs");
   await client3.close();
   client3 = null;
 
-  // regression: tabs_create_mcp as the session's FIRST call must adopt the
-  // auto-created group — a second call lands in the SAME group, and
-  // tabs_close_mcp can close the session's own tab
-  {
-    const client4 = await newClient("e2e-thread-4");
-    await sleep(300);
-    const tc1 = (await call(client4, "tabs_create_mcp", {})).json;
-    check("tabs_create_mcp-first auto-creates a group", /^grp_/.test(tc1.agentGroupId || ""), JSON.stringify(tc1));
-    const tc2 = (await call(client4, "tabs_create_mcp", {})).json;
-    check("second tabs_create_mcp reuses the SAME group (no window leak)", tc2.agentGroupId === tc1.agentGroupId, `${tc1.agentGroupId} vs ${tc2.agentGroupId}`);
-    const tcClose = (await call(client4, "tabs_close_mcp", { tabId: tc2.tabId })).json;
-    check("tabs_close_mcp works after create-first flow", tcClose.closed === true, JSON.stringify(tcClose));
-    await call(client4, "close_tab_group", { groupId: tc1.agentGroupId });
-    await client4.close();
-  }
-
-  // ---------------- durable groups: reconnect / failover / restore ----------------
-  section("Reconnect & failover");
-  const g2 = (await call(client2, "create_tab_group", { name: "E2E Beta", color: "orange", url: `${BASE}/second.html` })).json;
-  check("relay client creates its own group", /^grp_/.test(g2.groupId || ""), JSON.stringify(g2));
-  await call(client2, "wait_for", { tabId: g2.tabId, text: "SECOND_PAGE_MARKER", timeoutMs: 10000 });
-  const pt2 = (await call(client2, "get_page_text", { tabId: g2.tabId })).json;
+  // ---------------- hub failover ----------------
+  section("Hub failover");
+  await call(client2, "navigate", { tabId: c2a.tabId, url: `${BASE}/second.html` });
+  await call(client2, "wait_for", { tabId: c2a.tabId, text: "SECOND_PAGE_MARKER", timeoutMs: 10000 });
+  const pt2 = (await call(client2, "get_page_text", { tabId: c2a.tabId })).json;
   check("relay client reads its tab", (pt2.text || "").includes("SECOND_PAGE_MARKER"));
 
-  const rc = (await call(client2, "reconnect_tab_group", { groupId })).json;
-  check("reconnect_tab_group finds live group", rc.status === "connected" && rc.chromeGroupId > 0, JSON.stringify({ s: rc.status }));
-  check("reconnect returns tabs", (rc.tabs || []).length >= 1);
-
-  await client1.close(); // kills the hub process
+  await call(client1, "delete_my_tabs"); // clean this thread's workspace BEFORE its process dies
+  await client1.close();                 // kills the hub process
   client1 = null;
-  await sleep(4000);     // extension + relay both reconnect / re-elect
+  await sleep(4000);                     // extension + relay both reconnect / re-elect
   let failoverOk = false;
   for (let i = 0; i < 10; i++) {
     const s = await call(client2, "get_status");
@@ -629,33 +652,27 @@ try {
     await sleep(1500);
   }
   check("relay re-elects as hub and extension reconnects", failoverOk);
-  const afterFail = (await call(client2, "get_page_text", { tabId: g2.tabId })).json;
+  const stF = (await call(client2, "get_status")).json;
+  check("second client is now the hub", stF.session?.bridgeMode === "hub", JSON.stringify(stF.session));
+  const afterFail = (await call(client2, "get_page_text", { tabId: c2a.tabId })).json;
   check("tools work after failover", (afterFail.text || "").includes("SECOND_PAGE_MARKER"));
-
-  section("Close / restore");
-  const closeKeep = (await call(client2, "close_tab_group", { groupId: g2.groupId, keepRecord: true })).json;
-  check("close_tab_group closes tabs", closeKeep.closedTabs >= 1 && closeKeep.recordKept === true, JSON.stringify(closeKeep));
-  const gone = (await call(client2, "reconnect_tab_group", { groupId: g2.groupId })).json;
-  check("closed group reports closed + saved tabs", gone.status === "closed" && (gone.savedTabs || []).length >= 1, JSON.stringify(gone));
-  const restored = (await call(client2, "reconnect_tab_group", { groupId: g2.groupId, restore: true })).json;
-  check("restore recreates group with saved tabs", restored.status === "restored" && (restored.tabs || []).some((t) => t.url.includes("second.html")), JSON.stringify(restored.tabs));
-
-  const closeFinal = (await call(client2, "close_tab_group", { groupId: g2.groupId })).json;
-  check("final close deletes record", closeFinal.recordKept === false);
-  const groupsEnd = (await call(client2, "list_tab_groups")).json;
-  check("deleted group is forgotten", !(groupsEnd.groups || []).some((g) => g.groupId === g2.groupId));
 
   // ---------------- background guarantee ----------------
   section("Background guarantee");
-  const allTabsEnd = (await call(client2, "list_tabs", { all: true })).json;
-  const userTabEnd = allTabsEnd.tabs.find((t) => t.tabId === userTab.tabId);
-  check("user's tab still active after everything", userTabEnd?.active === true, JSON.stringify(userTabEnd));
-  const agentTabs = allTabsEnd.tabs.filter((t) => t.managed);
-  check("no agent tab is active in the user's window", agentTabs.filter((t) => t.windowId === userTab.windowId).every((t) => !t.active));
+  // Agent tabs share the user's window, and a window has exactly ONE active
+  // tab — so "no agent tab is active" means the user's tab kept the focus.
+  const agentTabsEnd = (await call(client2, "list_tabs")).json.tabs || [];
+  check("no agent tab became active", agentTabsEnd.length > 0 && agentTabsEnd.every((t) => !t.active),
+    JSON.stringify(agentTabsEnd.map((t) => [t.url, t.active])));
 
-  // cleanup: close remaining groups
-  await call(client2, "close_tab_group", { groupId });
-  await call(client2, "close_tab_group", { groupId: ctx1.groupId });
+  await call(client2, "delete_my_tabs");
+  await sleep(500);
+  const pagesAfter = await cdpPages();
+  const beforeUrls = new Set(userPagesBefore.map((p) => p.url));
+  check("the user's page survived everything", userPagesBefore.every((p) => pagesAfter.some((q) => q.url === p.url)),
+    JSON.stringify({ before: [...beforeUrls], after: pagesAfter.map((p) => p.url) }));
+  check("every agent page was cleaned up", pagesAfter.length === userPagesBefore.length,
+    JSON.stringify(pagesAfter.map((p) => p.url)));
 } catch (e) {
   failed++;
   failures.push("UNCAUGHT: " + (e?.message || e));
@@ -672,7 +689,7 @@ try {
   pageServer.close();
 }
 
-console.log(`\n════════════════════════════════`);
+console.log(`\n══════════════════════════════`);
 console.log(`  ${passed} passed, ${failed} failed`);
 if (failures.length) console.log("  failures:\n   - " + failures.join("\n   - "));
 process.exit(failed ? 1 : 0);
