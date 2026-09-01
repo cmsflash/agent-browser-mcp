@@ -53,7 +53,7 @@ try {
   section("tool surface");
   {
     const { tools } = await A.listTools();
-    const exempt = new Set(["get_status", "list_connected_browsers", "select_browser", "switch_browser", "reload_extension"]);
+    const exempt = new Set(["get_status", "list_connected_browsers", "reload_extension"]);
     const missing = tools.filter((t) => !exempt.has(t.name) && !(t.inputSchema.required || []).includes("threadTitle"));
     check("every tab-touching tool requires threadTitle", missing.length === 0, missing.map((t) => t.name).join(", "));
 

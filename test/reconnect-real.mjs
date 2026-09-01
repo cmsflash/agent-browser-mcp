@@ -32,7 +32,7 @@ const step = (n, ok, d = "") => { out.push(`${ok ? "✅" : "❌"} ${n}${d ? " �
 
 // --- agent process A ---
 const a = await mk("agent-A");
-await requireVersion(a, "1.1.1");
+await requireVersion(a, "1.2.0");
 const g = (await call(a, "create_tab_group", { name: "Reconnect proof", color: "pink", url: "https://example.com" })).json;
 step("A: group created", /^grp_/.test(g.groupId || ""), g.groupId);
 await call(a, "new_tab", { url: "https://iana.org" });

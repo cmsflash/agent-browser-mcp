@@ -16,7 +16,7 @@ const step = (n, ok, d = "") => { out.push(`${ok ? "✅" : "❌"} ${n}${d ? " �
 let gid = null;
 try {
   const st = (await call("get_status")).json;
-  step("fresh server is v1.1.1", st.serverVersion === "1.1.1", `server ${st.serverVersion}, ext ${st.extensionVersion}, ${st.session.bridgeMode}`);
+  step("fresh server is v1.2.0", st.serverVersion === "1.2.0", `server ${st.serverVersion}, ext ${st.extensionVersion}, ${st.session.bridgeMode}`);
 
   // official tab model, in the real profile
   const ctx = (await call("tabs_context_mcp", { createIfEmpty: true })).json;

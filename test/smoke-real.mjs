@@ -29,7 +29,7 @@ const step = (name, ok, detail = "") => { out.push(`${ok ? "✅" : "❌"} ${name
 
 let g = null;
 try {
-  await requireVersion(client, "1.1.1");
+  await requireVersion(client, "1.2.0");
   // NO retry loop: the very first call must succeed on its own.
   const st = await call("get_status");
   step("first call connects with no retry", !st.isError && st.json.connected,

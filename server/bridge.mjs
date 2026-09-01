@@ -19,6 +19,14 @@ export const DEFAULT_PORT = 47120;
 
 const log = (m) => process.stderr.write(`[chrome-agent] ${m}\n`);
 
+// Identify a browser the way the user thinks of it — by the account signed
+// into that profile. Extensions older than 1.2.0 send no email, so fall back
+// to the display name rather than printing "undefined".
+export function describeBrowser(info) {
+  const label = info.email || info.name || "unknown profile";
+  return `${label} — deviceId ${info.deviceId}`;
+}
+
 export class Bridge {
   constructor(port = DEFAULT_PORT) {
     this.port = port;
@@ -125,10 +133,15 @@ export class Bridge {
         }
         this.browsers.set(deviceId, {
           sock,
-          connectedAt: Date.now(),
+          // First time this browser was EVER seen, not the latest reconnect.
+          // MV3 service workers redial on every wake, so a live timestamp
+          // reshuffles the browsers on its own and makes any "most recent"
+          // choice a coin flip between the user's profiles.
+          connectedAt: prev?.connectedAt ?? Date.now(),
           info: {
             deviceId,
-            name: msg.name || `Chrome (${deviceId.slice(0, 8)})`,
+            name: msg.name || msg.email || `Chrome (${deviceId.slice(0, 8)})`,
+            ...(msg.email ? { email: msg.email } : {}),
             platform: msg.platform || "unknown",
             extensionVersion: msg.version || "unknown",
           },
@@ -172,12 +185,20 @@ export class Bridge {
 
   #wireRelayClient(sock) {
     log("relay client connected");
+    // Which browsers THIS relay has explicitly selected (hub:select_browser /
+    // hub:switch_browser). A deviceId that never went through one of those is
+    // a guess the relay made locally, not a decision the user made.
+    const chosen = new Set();
     sock.on("message", async (data) => {
       let msg;
       try { msg = JSON.parse(data.toString()); } catch { return; }
       if (!msg.id || !msg.method) return;
       try {
-        const result = await this.call(msg.method, msg.params || {}, msg.timeoutMs, msg.deviceId);
+        const deviceId = this.#authorizeRelayDevice(msg, chosen);
+        const result = await this.call(msg.method, msg.params || {}, msg.timeoutMs, deviceId);
+        if (msg.method === "hub:select_browser" || msg.method === "hub:switch_browser") {
+          if (result?.selected?.deviceId) chosen.add(result.selected.deviceId);
+        }
         if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ id: msg.id, ok: true, result }));
       } catch (e) {
         if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ id: msg.id, ok: false, error: String(e.message || e) }));
@@ -185,6 +206,23 @@ export class Bridge {
     });
     sock.on("close", () => {});
     sock.on("error", () => {});
+  }
+
+  // A relay running pre-1.2.0 code picks a browser itself — by connection
+  // recency — and sends that deviceId down as though the user had chosen it.
+  // That silently defeats the ambiguity guard, and no warning helps: the agent
+  // on the other side cannot upgrade its own process.
+  //
+  // So the hub judges the CLAIM rather than the relay: a deviceId this relay
+  // never explicitly selected is treated as absent while more than one browser
+  // is connected, which routes it back into the normal refusal. With a single
+  // browser connected the guess cannot be wrong, so nothing changes.
+  #authorizeRelayDevice(msg, chosen) {
+    const deviceId = msg.deviceId;
+    if (!deviceId || chosen.has(deviceId)) return deviceId;
+    if (String(msg.method || "").startsWith("hub:")) return deviceId;
+    const open = [...this.browsers.values()].filter((e) => e.sock.readyState === WebSocket.OPEN);
+    return open.length > 1 ? null : deviceId;
   }
 
   // ---------- relay mode ----------
@@ -244,18 +282,26 @@ export class Bridge {
       }
       return entry;
     }
-    // default: most recently connected
-    let best = null;
-    for (const entry of this.browsers.values()) {
-      if (entry.sock.readyState !== WebSocket.OPEN) continue;
-      if (!best || entry.connectedAt > best.connectedAt) best = entry;
-    }
-    if (!best) {
+    const open = [...this.browsers.values()].filter((e) => e.sock.readyState === WebSocket.OPEN);
+    if (!open.length) {
       throw new Error(
         "Chrome extension is not connected. Make sure Chrome is running and the 'Chrome Agent Bridge' extension is loaded and enabled (chrome://extensions). Click the extension icon → Reconnect if needed."
       );
     }
-    return best;
+    // With one browser there is nothing to get wrong. With several, every
+    // available tiebreak (connection order, recency) is an artifact of service
+    // workers waking up, NOT a statement of intent — and guessing wrong drives
+    // the wrong Google account, whose tab groups Chrome then saves and syncs
+    // there. Refuse, and name the options so the caller can choose.
+    if (open.length > 1) {
+      const list = open.map((e) => `  • ${describeBrowser(e.info)}`).join("\n");
+      throw new Error(
+        `${open.length} Chrome profiles are connected and none has been selected for this thread, so the target is ambiguous — refusing to guess.\n${list}\n` +
+        "Call select_browser with the deviceId you want (or switch_browser to pick it from inside Chrome). " +
+        "Ask the user which profile to use rather than picking one yourself."
+      );
+    }
+    return open[0];
   }
 
   async #hubControl(op, params) {

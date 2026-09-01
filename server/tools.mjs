@@ -263,23 +263,23 @@ tool(
 
 tool(
   "list_connected_browsers",
-  "List all Chrome browsers (extension instances) currently connected to this bridge. Returns each browser's deviceId, display name, OS platform, and connection info. Use this before select_browser to present choices to the user.",
+  "List all Chrome browsers (extension instances) currently connected to this bridge. Returns each browser's deviceId, signed-in profile email (when available), display name, OS platform, and connection info. Use this before select_browser to present choices to the user — quote the email, since that is how the user recognizes a profile.",
   {},
   { method: "hub:list_browsers", threadless: true }
 );
 
 tool(
   "select_browser",
-  "Select a specific Chrome browser by deviceId for browser automation, without broadcasting a pairing request. Use this after list_connected_browsers when the user has chosen one from the list.",
+  "Select, for YOUR thread only, which Chrome browser (profile) to drive — by deviceId, without broadcasting a pairing request. Use this after list_connected_browsers when the user has chosen one from the list. When more than one browser is connected, nothing is selected by default and page tools fail until you call this: the bridge will not guess which of the user's profiles to drive.",
   { deviceId: { type: "string", description: "The deviceId from list_connected_browsers." } },
-  { required: ["deviceId"], method: "hub:select_browser", threadless: true }
+  { required: ["deviceId"], method: "hub:select_browser" }
 );
 
 tool(
   "switch_browser",
-  "Send a connection request to every Chrome browser with the extension installed and wait (up to 2 minutes) for the user to click 'Connect' in the one they want to use (extension icon → Connect). Use this when the user wants to pick the browser themselves from inside Chrome rather than choosing from a list; otherwise prefer select_browser with a known deviceId. Auto-selects immediately when only one browser is connected.",
+  "Send a connection request to every Chrome browser with the extension installed and wait (up to 2 minutes) for the user to click 'Connect' in the one they want to use (extension icon → Connect). Use this when the user wants to pick the browser themselves from inside Chrome rather than choosing from a list; otherwise prefer select_browser with a known deviceId. Auto-selects immediately when only one browser is connected. The choice applies to YOUR thread only.",
   {},
-  { method: "hub:switch_browser", timeout: 130000, threadless: true }
+  { method: "hub:switch_browser", timeout: 130000 }
 );
 
 tool(

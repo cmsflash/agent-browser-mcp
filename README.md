@@ -63,8 +63,9 @@ Optional: launch Chrome with `--silent-debugger-extension-api` to hide the
 ## Tools (35)
 
 **Every tool below requires `threadTitle`**, except `get_status`,
-`list_connected_browsers`, `select_browser`, `switch_browser` and
-`reload_extension` (browser-wide utilities that touch no tabs).
+`list_connected_browsers` and `reload_extension` (browser-wide utilities that
+touch no tabs). `select_browser` / `switch_browser` take it too, because the
+chosen browser is remembered per thread rather than per process.
 
 Names and parameters otherwise track the official claude-in-chrome MCP (see
 `reference/alignment-map.md`); the differences are the mandatory `threadTitle`,
@@ -102,6 +103,13 @@ Shortcuts are user-defined in `chrome.storage.local` under `shortcuts`:
   fake it); `/relay` requires a custom header (web pages can't set one).
 - Anything with local shell access could still connect — same trust model as
   a local CDP port. Don't run untrusted local software while using this.
+- **Profile routing is never guessed.** With two or more Chrome profiles
+  connected, a thread that has not chosen one is refused (with both accounts
+  named) instead of being pointed at whichever extension reconnected last.
+  Picking wrong is not a cosmetic error: Chrome 129+ auto-saves tab groups, so
+  a misrouted group syncs into the wrong Google account. The hub also ignores a
+  `deviceId` from a relay that never explicitly selected it, which is what keeps
+  an older, still-running agent session from silently re-introducing the guess.
 
 ## Testing
 

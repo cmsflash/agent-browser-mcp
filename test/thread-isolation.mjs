@@ -87,7 +87,7 @@ try {
     const tools = await clientA.listTools();
     const withoutThread = tools.tools.filter((t) =>
       !(t.inputSchema.required || []).includes("threadTitle") &&
-      !["get_status", "list_connected_browsers", "select_browser", "switch_browser", "reload_extension"].includes(t.name)
+      !["get_status", "list_connected_browsers", "reload_extension"].includes(t.name)
     );
     check("every tab-touching tool requires threadTitle", withoutThread.length === 0,
       withoutThread.map((t) => t.name).join(", "));

@@ -18,7 +18,7 @@ import { Bridge, DEFAULT_PORT } from "./bridge.mjs";
 import { TOOLS } from "./tools.mjs";
 import { encodeGif } from "./gif.mjs";
 
-const VERSION = "1.1.1";
+const VERSION = "1.2.0";
 const port = Number(process.env.CHROME_AGENT_PORT || DEFAULT_PORT);
 const bridge = new Bridge(port);
 await bridge.start();
@@ -28,16 +28,28 @@ await bridge.start();
 // A single MCP process may serve MORE THAN ONE agent thread: some hosts share
 // one server across all sessions, and a process can be restarted mid-thread.
 // So the thread's browser workspace is keyed by the threadTitle it passes on
-// every call (resolved to a group inside the extension), and the only
-// per-thread state we keep here is a convenience "current tab" cache.
+// every call (resolved to a group inside the extension), and the state we keep
+// here — its current tab and its chosen browser — is keyed the same way.
 
-const session = {
-  browserId: null, // deviceId of the selected browser (null = most recent)
-};
+// threadTitle -> deviceId chosen by THAT thread. Process-global selection
+// would let one thread's select_browser silently retarget every other thread
+// sharing this process — including onto a different Chrome profile.
+const selectedBrowser = new Map();
 
 // threadTitle -> last tab this thread touched (so tabId can be omitted).
 const currentTab = new Map();
 const MAX_THREADS = 200;
+
+function browserFor(thread) {
+  return selectedBrowser.get(thread) ?? null;
+}
+
+function rememberBrowser(thread, deviceId) {
+  if (!thread || !deviceId) return;
+  selectedBrowser.delete(thread);
+  selectedBrowser.set(thread, deviceId);
+  while (selectedBrowser.size > MAX_THREADS) selectedBrowser.delete(selectedBrowser.keys().next().value);
+}
 
 function rememberTab(thread, tabId) {
   if (!thread || tabId == null) return;
@@ -103,7 +115,7 @@ function updateSession(name, args, result) {
       break;
     case "select_browser":
     case "switch_browser":
-      if (result?.selected?.deviceId) session.browserId = result.selected.deviceId;
+      if (result?.selected?.deviceId) rememberBrowser(thread, result.selected.deviceId);
       break;
   }
 }
@@ -138,14 +150,27 @@ function toolTimeout(tool, args) {
   return timeout;
 }
 
-// Pin the session to a concrete browser on first use, so another Chrome
-// profile connecting mid-session can never hijack the routing.
-async function ensureBrowserPinned() {
-  if (session.browserId) return;
+// Pin the thread to a concrete browser on first use, so another Chrome profile
+// connecting mid-thread can never hijack the routing.
+//
+// Only a SINGLE connected browser is unambiguous enough to adopt automatically.
+// Sorting several by connection time used to look like a sensible default, but
+// MV3 service workers redial constantly, so it really selected whichever
+// profile woke up last — routing work into the wrong Google account at random.
+// When there is a real choice to make, leave the thread unpinned and let
+// #pickBrowser refuse with the list of candidates.
+async function profileLabel(deviceId) {
+  const r = await bridge.call("hub:list_browsers", {}, 10000).catch(() => null);
+  const b = (r?.browsers || []).find((x) => x.deviceId === deviceId);
+  return b ? (b.email || b.name || null) : null;
+}
+
+async function ensureBrowserPinned(thread) {
+  if (browserFor(thread)) return;
   try {
     const r = await bridge.call("hub:list_browsers", {}, 10000);
-    const bs = (r.browsers || []).sort((a, b) => (b.connectedAt || 0) - (a.connectedAt || 0));
-    if (bs.length) session.browserId = bs[0].deviceId;
+    const bs = r.browsers || [];
+    if (bs.length === 1) rememberBrowser(thread, bs[0].deviceId);
   } catch { /* hub not ready yet — stay unpinned, try again next call */ }
 }
 
@@ -166,24 +191,26 @@ async function runTool(name, rawArgs, { inBatch = false, noSession = false } = {
   if (name === "shortcuts_execute") return runShortcut(args);
   if (name === "navigate" && !inBatch) return runNavigate(args, tool);
 
-  if (!tool.method.startsWith("hub:")) await ensureBrowserPinned();
+  const thread = args.threadTitle;
+  if (!tool.method.startsWith("hub:")) await ensureBrowserPinned(thread);
   let result;
   try {
-    result = await bridge.call(tool.method, args, toolTimeout(tool, args), session.browserId);
+    result = await bridge.call(tool.method, args, toolTimeout(tool, args), browserFor(thread));
   } catch (e) {
     const msg = String(e.message || e);
     // the session's tab died outside our view — drop it so tabs_context/
     // navigate auto-context can recover instead of failing forever
-    if (args.tabId != null && args.tabId === currentTab.get(args.threadTitle) && /does not exist/.test(msg)) {
-      currentTab.delete(args.threadTitle);
+    if (args.tabId != null && args.tabId === currentTab.get(thread) && /does not exist/.test(msg)) {
+      currentTab.delete(thread);
     }
-    // pinned browser vanished, but exactly one is connected → repin + retry
-    if (/is not connected/.test(msg) && session.browserId) {
+    // pinned browser vanished, but exactly one is connected → repin + retry.
+    // Still exactly one, so there is no profile ambiguity to resolve.
+    if (/is not connected/.test(msg) && browserFor(thread)) {
       const r = await bridge.call("hub:list_browsers", {}, 10000).catch(() => null);
       const bs = r?.browsers || [];
       if (bs.length === 1) {
-        session.browserId = bs[0].deviceId;
-        result = await bridge.call(tool.method, args, toolTimeout(tool, args), session.browserId);
+        rememberBrowser(thread, bs[0].deviceId);
+        result = await bridge.call(tool.method, args, toolTimeout(tool, args), browserFor(thread));
       } else {
         throw e;
       }
@@ -205,8 +232,12 @@ async function runTool(name, rawArgs, { inBatch = false, noSession = false } = {
   }
   if (name === "get_status") {
     result.serverVersion = VERSION;
+    const deviceId = browserFor(thread);
     result.session = {
-      selectedBrowser: session.browserId,
+      selectedBrowser: deviceId,
+      // A deviceId alone cannot be checked against intent. Name the account so
+      // "am I driving the right profile?" is answerable from one status call.
+      selectedProfile: deviceId ? await profileLabel(deviceId) : null,
       bridgeMode: bridge.mode,
       threadsSeen: currentTab.size,
     };
@@ -230,11 +261,12 @@ async function runNavigate(args, tool) {
       tabId = made.tabId;
     }
     if (tabId == null) throw new Error("Could not create a tab for navigation — is Chrome running?");
-    const nav = await bridge.call("navigate", { ...args, tabId }, toolTimeout(tool, args), session.browserId);
+    const nav = await bridge.call("navigate", { ...args, tabId }, toolTimeout(tool, args), browserFor(thread));
     rememberTab(thread, tabId);
     return { ...nav, context: ctx };
   }
-  const result = await bridge.call("navigate", args, toolTimeout(tool, args), session.browserId);
+  await ensureBrowserPinned(thread);
+  const result = await bridge.call("navigate", args, toolTimeout(tool, args), browserFor(thread));
   rememberTab(thread, args.tabId);
   return result;
 }
@@ -305,7 +337,7 @@ async function runUploadImage(args) {
       mimeType: img.mimeType,
     },
     45000,
-    session.browserId
+    browserFor(args.threadTitle)
   );
 }
 
@@ -315,7 +347,7 @@ async function runGifExport(args) {
     "gif_creator",
     { ...args, action: "export_frames" },
     120000,
-    session.browserId
+    browserFor(args.threadTitle)
   );
   if (!collected.frames?.length) {
     throw new Error("No recorded frames. Use action:'start_recording', perform actions, then export.");
@@ -335,7 +367,7 @@ async function runGifExport(args) {
         "download_data",
         { filename, dataUrl: `data:image/gif;base64,${Buffer.from(bytes).toString("base64")}` },
         30000,
-        session.browserId
+        browserFor(args.threadTitle)
       );
       downloaded = true;
     } catch (e) {
@@ -348,7 +380,7 @@ async function runGifExport(args) {
 // shortcuts_execute: resolve, then run steps in the background (fire & forget)
 async function runShortcut(args) {
   if (args.tabId == null) throw new Error("shortcuts_execute requires a tabId (the tab the shortcut runs on).");
-  const list = await bridge.call("shortcuts_list", { tabId: args.tabId }, 15000, session.browserId);
+  const list = await bridge.call("shortcuts_list", { tabId: args.tabId }, 15000, browserFor(args.threadTitle));
   const all = list.shortcuts || [];
   const sc = all.find((s) => s.id === args.shortcutId) || all.find((s) => s.command === args.command);
   if (!sc) {

@@ -97,9 +97,16 @@ Buffering starts when the tab is first attached (any interaction attaches).
   sit in the user's own window, so `resize_window` resizes the window they are
   looking at; it is allowed (and tells you when the window is shared) but it
   interrupts them. `set_viewport` emulates any size with no visible effect.
-- Multiple browsers: `list_connected_browsers` → `select_browser`, or
-  `switch_browser` to let the user click Connect in the one they want (these
-  three are the only tools that need no `threadTitle`).
+- **Multiple profiles: you must choose.** When more than one Chrome is
+  connected, nothing is selected by default and page tools fail with the list
+  of candidates — the bridge will not guess which of the user's profiles to
+  drive, because a wrong guess files their tab groups (which Chrome auto-saves
+  and syncs) into the wrong Google account. Call `list_connected_browsers` →
+  `select_browser`, or `switch_browser` to let them click Connect in the one
+  they want. Each browser reports the profile's signed-in `email`; quote that
+  rather than the deviceId, since it is how the user recognizes a profile. The
+  choice is per-thread, so it never retargets another agent. With just one
+  browser connected, it is adopted automatically and none of this applies.
 
 ## Etiquette & exceptions
 
