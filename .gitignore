@@ -3,3 +3,4 @@ test/browsers/
 .DS_Store
 *.log
 coverage/
+.worktrees/
