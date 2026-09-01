@@ -2,8 +2,8 @@
 // Chrome Agent Bridge — MCP server (stdio), v1.1.0.
 //
 // One process per agent thread. The tool surface is aligned verbatim with the
-// official claude-in-chrome MCP (see reference/alignment-map.md), plus the
-// durable tab-group extension layer. This file owns per-session state
+// official claude-in-chrome MCP, plus the durable tab-group extension layer.
+// This file owns per-session state
 // (current group/tab, selected browser, screenshot image cache) and the
 // server-side composites: browser_batch, gif export encoding, upload_image,
 // save_to_disk, shortcuts execution, and navigate's auto-context.

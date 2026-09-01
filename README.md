@@ -88,9 +88,13 @@ rather than silently routed to the wrong Chrome profile.
 touch no tabs). `select_browser` / `switch_browser` take it too, because the
 chosen browser is remembered per thread rather than per process.
 
-Names and parameters otherwise track the official claude-in-chrome MCP (see
-`reference/alignment-map.md`); the differences are the mandatory `threadTitle`,
-the removal of all tab-group management, and `delete_my_tabs`:
+Names and parameters otherwise track the official claude-in-chrome MCP. The
+deliberate divergences: the mandatory `threadTitle`; no tab-group management
+(agents never name or switch groups — the group is infrastructure);
+**`delete_my_tabs` instead of closing tabs** (Chrome auto-saves closed tab
+groups, so "close" always leaves a synced saved-group behind); and the window
+model — agent groups join the profile's last-active window rather than opening
+a new one, because even an unfocused new window is a user-visible event.
 
 `tabs_context_mcp` · `tabs_create_mcp` · `navigate` ·
 `computer` (incl. `zoom`, `scroll_to`, `hover`, ref targeting, key sequences)

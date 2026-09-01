@@ -2,8 +2,8 @@
 //
 // The primary surface is a VERBATIM alignment with the official
 // claude-in-chrome MCP (22 tools: same names, same parameter schemas, same
-// semantics — see reference/alignment-map.md). On top of that, chrome-agent
-// keeps its durable tab-group layer and a few power tools as extensions.
+// semantics). On top of that, chrome-agent keeps its durable tab-group layer
+// and a few power tools as extensions.
 //
 // Design contract:
 //   * ENFORCED: exactly one tab group per agent thread. Every tool takes a
