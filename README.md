@@ -47,6 +47,27 @@ mkdir -p ~/.claude/skills && ln -s "$(pwd)/skills/chrome-agent" ~/.claude/skills
 Optional: launch Chrome with `--silent-debugger-extension-api` to hide the
 "…is debugging this browser" info bar (cosmetic only).
 
+## Updating
+
+```bash
+./update.sh           # idempotent; restarts the hub only if it predates the code
+```
+
+Every harness (Claude Code, Codex, OpenCode, DSH) launches the server from this
+checkout by absolute path, so **new** agent sessions always get current code for
+free. Two things do not update themselves:
+
+- **The hub** — one MCP process owns port 47120 for the whole machine and can be
+  days old. `update.sh` restarts it, winning the takeover race against the other
+  relays (which would otherwise inherit the role while still running old code).
+- **The extension** — reload it per profile at `chrome://extensions`, or call the
+  `reload_extension` tool once per profile.
+
+Agent sessions already running keep their own older MCP process until their app
+restarts. That is safe rather than merely tolerated: the hub does not trust a
+stale relay's browser choice (see below), so an outdated session is refused
+rather than silently routed to the wrong Chrome profile.
+
 ## The contract
 
 | Requirement | How it's met |
