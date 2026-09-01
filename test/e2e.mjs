@@ -153,7 +153,7 @@ try {
 
   const status0 = (await call(client1, "get_status")).json;
   check("get_status returns session info", status0.session?.bridgeMode === "hub", JSON.stringify(status0.session));
-  check("server reports v1.2.0", status0.serverVersion === "1.2.0", JSON.stringify(status0.serverVersion));
+  check("server reports v1.2.1", status0.serverVersion === "1.2.1", JSON.stringify(status0.serverVersion));
   check("extension reports v1.2.0", status0.extensionVersion === "1.2.0", JSON.stringify(status0.extensionVersion));
 
   await sleep(1500);

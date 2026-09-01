@@ -306,7 +306,7 @@ tool(
 
 tool(
   "get_status",
-  "Health check: is the Chrome extension connected, and which browser is selected. Call this first if other tools fail.",
+  "Health check: is the Chrome extension connected, and which browser is selected for your thread. Call this first if other tools fail. With more than one profile connected and nothing selected yet, this returns the candidate browsers (with their signed-in emails) instead of guessing — you must then call select_browser.",
   {},
   { method: "status", threadless: true }
 );

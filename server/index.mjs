@@ -18,7 +18,7 @@ import { Bridge, DEFAULT_PORT } from "./bridge.mjs";
 import { TOOLS } from "./tools.mjs";
 import { encodeGif } from "./gif.mjs";
 
-const VERSION = "1.2.0";
+const VERSION = "1.2.1";
 const port = Number(process.env.CHROME_AGENT_PORT || DEFAULT_PORT);
 const bridge = new Bridge(port);
 await bridge.start();
@@ -192,6 +192,26 @@ async function runTool(name, rawArgs, { inBatch = false, noSession = false } = {
   if (name === "navigate" && !inBatch) return runNavigate(args, tool);
 
   const thread = args.threadTitle;
+  // get_status is the health check an agent calls FIRST — often precisely
+  // because something is wrong. It must not itself fail on profile ambiguity:
+  // when several browsers are connected and this thread hasn't chosen one,
+  // answer with the candidates so the caller can choose.
+  if (name === "get_status" && !browserFor(thread)) {
+    const r = await bridge.call("hub:list_browsers", {}, 10000).catch(() => null);
+    const bs = r?.browsers || [];
+    if (bs.length > 1) {
+      return {
+        connected: true,
+        ambiguous: true,
+        browsers: bs.map((b) => ({ deviceId: b.deviceId, email: b.email || null, name: b.name })),
+        note:
+          `${bs.length} Chrome profiles are connected and none is selected for this thread. ` +
+          "Call select_browser with the deviceId you want — ask the user which account to use rather than picking one yourself.",
+        serverVersion: VERSION,
+        session: { selectedBrowser: null, bridgeMode: bridge.mode, threadsSeen: currentTab.size },
+      };
+    }
+  }
   if (!tool.method.startsWith("hub:")) await ensureBrowserPinned(thread);
   let result;
   try {
