@@ -1,10 +1,11 @@
 # Interface alignment with claude-in-chrome (v1.1.0)
 
-Source of truth: live schemas pulled from the official `claude-in-chrome` MCP
-(22 tools), stored alongside this file. Strategy: **adopt the official surface
-verbatim** (same names, same parameter schemas, same semantics), keep the
-durable tab-group layer as chrome-agent extensions, delete our redundant
-originals.
+Strategy, recorded as-built at v1.1.0: **adopt the official surface verbatim**
+(same names, same parameter schemas, same semantics), keep the durable
+tab-group layer as chrome-agent extensions, delete our redundant originals.
+A schema capture of the official tools (a partial one — 10 of the 22) lived
+alongside this file for a while; it is no longer kept, so treat the official
+MCP itself as the reference when re-comparing.
 
 > **Historical snapshot (v1.1.0).** The tool surface has since moved to the
 > `threadTitle` model, which removed every agent-facing tab-group tool; see
@@ -23,10 +24,10 @@ originals.
 
 | Tool | Implementation notes |
 |---|---|
-| `tabs_context_mcp` | Session's current group = "the MCP tab group". `createIfEmpty:true` creates a group in a NEW unfocused window with one empty tab (official behavior) and registers it in the durable registry (so it still gets a `grp_…` id). |
+| `tabs_context_mcp` | Session's current group = "the MCP tab group". `createIfEmpty:true` creates a group in a NEW unfocused window with one empty tab (official behavior) and registers it in the durable registry (so it still gets a `grp_…` id). *(v1.1.0 semantics — `createIfEmpty` and the session-group notion were removed by the threadTitle model; the workspace now materializes on first use and this tool only lists.)* |
 | `tabs_create_mcp` | New empty background tab in the session group (auto-creates group if none). |
-| `tabs_close_mcp` | Strict: only closes tabs in the session's current group. (`close_tab` remains as the permissive variant.) |
-| `navigate` | Standalone URL nav with no tabId auto-runs `tabs_context_mcp{createIfEmpty:true}` and appends the context to the result. `back`/`forward` require tabId. Inside `browser_batch`, tabId is required (no session default injected). Superset: also accepts `reload`. |
+| `tabs_close_mcp` | Strict: only closes tabs in the session's current group. (`close_tab` remains as the permissive variant.) *(v1.1.0 — since removed; `close_tab` is the surviving form.)* |
+| `navigate` | Standalone URL nav with no tabId auto-runs `tabs_context_mcp{createIfEmpty:true}` and appends the context to the result. `back`/`forward` require tabId. Inside `browser_batch`, tabId is required (no session default injected). Superset: also accepts `reload`. *(The auto-context survives, but reports the workspace as it was at call start and creates the caller's first tab itself.)* |
 | `computer` | Adds official actions `zoom` (region screenshot, auto-magnified), `scroll_to` (ref), `hover` (ref or coordinate); `ref` usable instead of `coordinate` for clicks; `modifiers` as STRING (`"ctrl+shift"`; legacy array still accepted); `key` takes space-separated sequences (`"Backspace Backspace"`) + `repeat` (1-100); `save_to_disk` writes the image to ~/Downloads and returns the path. Superset: keeps `middle_click`, `left_mouse_down/up`, `hold_key`, `cursor_position` (extra enum values). `wait` max 10 s (aligned). |
 | `read_page` | Official params: `filter` (`interactive`\|`all`, default **all** — includes non-visible elements, marked `(hidden)`), `depth` (default 15), `max_chars` (default 50000, truncates at line boundary with full-size note), `ref_id` (subtree focus). Refs renamed to official format `ref_N` (stale-ref detection kept internally via per-document nonce). |
 | `get_page_text` | Aligned; keeps optional `maxChars`/`offset` pagination extras. |
@@ -40,8 +41,8 @@ originals.
 | `read_console_messages` | Renames `read_console`; official params (`pattern` required regex, `onlyErrors`, `limit` 100, `clear`). |
 | `read_network_requests` | Renames `read_network`; official params (`urlPattern` substring, `limit` 100, `clear`); buffer cleared on cross-domain navigation (aligned). |
 | `resize_window` | Resizes the real window containing the tab. Since agent groups now live in the user's last-active window (see the window-model note above), this usually resizes a window the user is looking at: it is allowed, and flags `sharedWithUser` in the result. `set_viewport` is the non-intrusive alternative. |
-| `list_connected_browsers` | Hub now supports MULTIPLE extension connections (e.g. Chrome + Chrome Canary + another profile). Each extension sends a persistent `instanceId` + platform info on hello. |
-| `select_browser` | Per-session routing by `deviceId`. |
+| `list_connected_browsers` | Hub now supports MULTIPLE extension connections (e.g. Chrome + Chrome Canary + another profile). Each extension sends a persistent `instanceId` + platform info on hello; since 1.2.0 also the profile's signed-in email. |
+| `select_browser` | Per-session routing by `deviceId` at v1.1.0; since 1.2.0 the choice is per-`threadTitle`, and nothing is selected by default when more than one browser is connected (the call is refused with the candidates listed rather than guessed). |
 | `switch_browser` | Broadcasts a pairing request: every connected extension shows a notification + a "Connect" button in its popup; first user click wins (2-minute wait, aligned). Auto-selects when only one browser is connected. |
 | `shortcuts_list` / `shortcuts_execute` | Storage-backed registry (`chrome.storage.local.shortcuts`: `[{id, command, description, isWorkflow, steps:[{name, input}]}]`, `$TAB` placeholder → tabId). Execute runs steps sequentially in the background and returns immediately (aligned). Empty by default. |
 

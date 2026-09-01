@@ -147,12 +147,20 @@ node window-reuse.mjs           # groups land in the user's window; cleanup is s
 node freeze-recovery.mjs        # frozen-renderer recovery
 node background-guarantee.mjs   # OS-level focus-steal check
 
-# against your real, logged-in Chrome (creates + closes its own tab group)
-node smoke-real.mjs             # connect, browse, screenshot, click, reconnect
-node reconnect-real.mjs         # agent restarts, reconnects to its group by ID
+# against your real, logged-in Chrome (creates + deletes its own tab group)
+node smoke-real.mjs             # connect, browse, screenshot, click, cleanup
+node reconnect-real.mjs         # agent restarts, re-attaches by threadTitle
 node aligned-real.mjs           # tabs_context/zoom/batch/gif/resize/browsers
 node thread-isolation-real.mjs  # 25 assertions: isolation + delete, self-cleaning
 node frontmost-real.mjs         # macOS frontmost check in the real profile
+```
+
+Real-profile tests never guess which Chrome profile to drive: with exactly one
+connected they use it; with several they fail and ask for `CAB_TEST_BROWSER`
+(a deviceId or email substring):
+
+```bash
+CAB_TEST_BROWSER=you@example.com node smoke-real.mjs
 ```
 
 Tests need **Chrome for Testing**, and specifically a build that still honours

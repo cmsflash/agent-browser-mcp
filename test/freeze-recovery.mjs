@@ -18,9 +18,11 @@ const extDir = makeTestExtension();
 const chrome = launchChrome({ extensionDir: extDir, profileDir: profile, args: ["--remote-debugging-port=9444","--window-size=1100,800","about:blank"] });
 const t = new StdioClientTransport({ command:"node", args:[join(root,"server","index.mjs")], stderr:"ignore", env: serverEnv });
 const c = new Client({name:"vf",version:"1.0.0"}); await c.connect(t);
-const call = async (name,args={}) => { const s=Date.now(); const r=await c.callTool({name,arguments:args}); const x=(r.content||[]).find(y=>y.type==="text"); let j=null; try{j=JSON.parse(x?.text||"null")}catch{j={_raw:x?.text}} return {isError:!!r.isError,json:j,ms:Date.now()-s}; };
+const TH = "freeze-recovery test";
+const call = async (name,args={}) => { const s=Date.now(); const r=await c.callTool({name,arguments:{threadTitle:TH,...args}}); const x=(r.content||[]).find(y=>y.type==="text"); let j=null; try{j=JSON.parse(x?.text||"null")}catch{j={_raw:x?.text}} return {isError:!!r.isError,json:j,ms:Date.now()-s}; };
 for (let i=0;i<25;i++){const s=await call("get_status");if(!s.isError&&s.json.connected)break;await sleep(1000);}
-const g = (await call("create_tab_group",{name:"freeze fix",url:"http://127.0.0.1:8962/index.html"})).json;
+await call("delete_my_tabs");
+const g = (await call("new_tab",{url:"http://127.0.0.1:8962/index.html"})).json;
 await sleep(1000);
 
 // freeze the page from an independent CDP client
@@ -45,5 +47,5 @@ const r3 = await call("click", { tabId: g.tabId, selector: "#inc" });
 const cnt = await call("javascript_tool", { action: "javascript_exec", text: "document.querySelector('#count').textContent", tabId: g.tabId });
 console.log(!r3.isError && cnt.json.result === "1" ? "✅ interaction works after wake" : `❌ interaction broken: ${JSON.stringify(cnt.json)}`);
 
-await call("close_tab_group",{groupId:g.groupId});
+await call("delete_my_tabs");
 await c.close(); chrome.kill(); pages.close(); cleanup([profile,extDir]); process.exit(0);

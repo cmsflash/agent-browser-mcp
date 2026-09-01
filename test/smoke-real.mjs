@@ -1,82 +1,71 @@
 // Smoke test against the user's REAL Chrome profile (minimal, self-cleaning).
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-const transport = new StdioClientTransport({ command: "node", args: ["../server/index.mjs"], stderr: "ignore" });
-const client = new Client({ name: "smoke-real", version: "1.0.0" });
-await client.connect(transport);
-const call = async (name, args = {}) => {
-  const r = await client.callTool({ name, arguments: args });
-  const t = (r.content || []).find((c) => c.type === "text");
-  const img = (r.content || []).find((c) => c.type === "image");
-  let json = null;
-  try { json = JSON.parse(t?.text || "null"); } catch { json = { _raw: t?.text }; }
-  return { isError: !!r.isError, json, img };
+// Covers: hub connection, implicit workspace creation, background driving,
+// trusted click, stale-ref refusal, main-world JS, and true cleanup.
+//
+// With multiple Chrome profiles connected, set CAB_TEST_BROWSER (deviceId or
+// email substring) — see real-harness.mjs.
+import { connect, mkCall, selectTargetBrowser, requireVersion } from "./real-harness.mjs";
+
+const TH = "smoke-real test";
+const client = await connect("smoke-real");
+const call = mkCall(client, TH);
+const out = [];
+const step = (name, ok, detail = "") => {
+  out.push(`${ok ? "✅" : "❌"} ${name}${detail ? " — " + detail : ""}`);
+  if (!ok) throw new Error(name);
 };
 
-// Warn if the extension in Chrome predates the fixes these tests check.
-async function requireVersion(c, want) {
-  const r = await c.callTool({ name: "get_status", arguments: {} });
-  const t = (r.content || []).find((x) => x.type === "text");
-  const v = (() => { try { return JSON.parse(t.text).extensionVersion; } catch { return null; } })();
-  if (v !== want) {
-    console.log(`\n⚠ Loaded extension is v${v}, expected v${want}.\n  Reload it: chrome://extensions → Chrome Agent Bridge → ↻\n  (or, from v1.0.1+, call the reload_extension tool)\n`);
-  }
-  return v;
-}
-
-const out = [];
-const step = (name, ok, detail = "") => { out.push(`${ok ? "✅" : "❌"} ${name}${detail ? " — " + detail : ""}`); if (!ok) throw new Error(name); };
-
-let g = null;
 try {
-  await requireVersion(client, "1.2.0");
-  // NO retry loop: the very first call must succeed on its own.
+  const browser = await selectTargetBrowser(call);
+  step("target browser selected", true, browser.email || browser.name);
+  await requireVersion(call, "1.2.0");
+
+  // NO retry loop: the very first status call must succeed on its own.
   const st = await call("get_status");
   step("first call connects with no retry", !st.isError && st.json.connected,
     `bridge mode: ${st.json?.session?.bridgeMode}, extension v${st.json?.extensionVersion}`);
 
-  g = (await call("create_tab_group", { name: "Bridge smoke test", color: "green", url: "https://example.com" })).json;
-  step("tab group created in real profile", /^grp_/.test(g.groupId || ""), `${g.groupId} (chrome group ${g.chromeGroupId})`);
+  // reset any workspace left by a crashed previous run (idempotent)
+  await call("delete_my_tabs");
 
-  const txt = (await call("get_page_text", { tabId: g.tabId })).json;
+  const tab = (await call("new_tab", { url: "https://example.com" })).json;
+  step("workspace created implicitly by first tab", tab.tabId > 0 && tab.active === false, `tab ${tab.tabId}`);
+
+  const txt = (await call("get_page_text", { tabId: tab.tabId })).json;
   step("page text read", (txt.text || "").includes("Example Domain"));
 
-  const shot = await call("screenshot", { tabId: g.tabId });
+  const shot = await call("screenshot", { tabId: tab.tabId });
   step("background screenshot captured", !!shot.img && shot.img.data.length > 3000, `${Math.round(shot.img.data.length * 3 / 4 / 1024)}KB jpeg`);
 
-  const found = (await call("find", { tabId: g.tabId, query: "Learn more" })).json;
+  const found = (await call("find", { tabId: tab.tabId, query: "Learn more" })).json;
   step("element found by text", found.count >= 1 && ["natural-language", "selector"].includes(found.results[0].matchedBy),
     `${found.results?.[0]?.ref} "${found.results?.[0]?.text}"`);
 
-  await call("click", { tabId: g.tabId, ref: found.results[0].ref });
-  const wf = await call("wait_for", { tabId: g.tabId, text: "IANA", timeoutMs: 20000 });
+  await call("click", { tabId: tab.tabId, ref: found.results[0].ref });
+  const wf = await call("wait_for", { tabId: tab.tabId, text: "IANA", timeoutMs: 20000 });
   step("trusted click navigated to iana.org", !wf.isError && wf.json.satisfied === true);
 
-  const stale = await call("click", { tabId: g.tabId, ref: found.results[0].ref });
-  step("stale ref rejected after navigation", stale.isError && /previous page|stale/.test(stale.json?._raw || ""));
+  const stale = await call("click", { tabId: tab.tabId, ref: found.results[0].ref });
+  step("stale ref rejected after navigation", stale.isError && /previous page|stale/i.test(stale.text), stale.text.slice(0, 90));
 
-  const kb = await call("javascript_tool", { action: "javascript_exec", text: "location.host", tabId: g.tabId });
+  const kb = await call("javascript_tool", { action: "javascript_exec", text: "location.host", tabId: tab.tabId });
   step("javascript runs in main world", kb.json.result === "www.iana.org" || kb.json.result === "iana.org", kb.json.result);
 
-  const all = (await call("list_tabs", { all: true })).json;
-  // Agent groups live in their OWN background window, where their tab is
-  // necessarily active. The invariant is that no agent tab becomes active in
-  // a window the USER owns (i.e. one that holds unmanaged tabs).
-  const userWindows = new Set(all.tabs.filter((t) => !t.managed).map((t) => t.windowId));
-  const agentActiveInUserWin = all.tabs.filter((t) => t.managed && t.active && userWindows.has(t.windowId));
-  const userActive = all.tabs.filter((t) => !t.managed && t.active);
-  step("user's tabs undisturbed (no agent tab active in a user window)",
-    agentActiveInUserWin.length === 0 && userActive.length >= 1,
-    `${all.tabs.length} tabs total across ${userWindows.size} user window(s)`);
+  // Agent tabs share the user's window, and a window has exactly one active
+  // tab — so "no agent tab is active" IS "the user kept theirs". Only the
+  // agent's own tabs are visible to it, which is all this invariant needs.
+  const mine = (await call("list_tabs")).json;
+  step("user's tab undisturbed (no agent tab active)",
+    (mine.tabs || []).length >= 1 && mine.tabs.every((t) => !t.active),
+    JSON.stringify(mine.tabs?.map((t) => [String(t.url).slice(0, 30), t.active])));
 
-  const rec = (await call("reconnect_tab_group", { groupId: g.groupId })).json;
-  step("reconnect by internal ID works", rec.status === "connected" && rec.tabs.length >= 1);
+  const del = (await call("delete_my_tabs")).json;
+  step("cleanup deletes the workspace", del.deleted === true && del.closedTabs >= 1, `${del.closedTabs} tab(s)`);
+} catch (e) {
+  out.push("❌ " + (e?.message || e));
 } finally {
-  if (g?.groupId) {
-    const cl = (await call("close_tab_group", { groupId: g.groupId })).json;
-    out.push(cl?.closedTabs >= 1 ? "✅ smoke group closed and forgotten" : "⚠ cleanup: " + JSON.stringify(cl).slice(0, 120));
-  }
+  try { await call("delete_my_tabs"); } catch {}
   console.log(out.join("\n"));
   await client.close();
-  process.exit(out.some((l) => l.startsWith("❌")) ? 1 : 0);
 }
+process.exit(out.some((l) => l.startsWith("❌")) ? 1 : 0);
