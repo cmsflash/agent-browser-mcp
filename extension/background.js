@@ -86,12 +86,30 @@ async function identity() {
   }
   let platform = "unknown";
   try { platform = (await chrome.runtime.getPlatformInfo()).os; } catch (_) {}
+  const email = await profileEmail();
   identityCache = {
     instanceId,
     platform,
-    name: browserName || `Chrome (${platform}, ${instanceId.slice(0, 6)})`,
+    ...(email ? { email } : {}),
+    name: browserName || email || `Chrome (${platform}, ${instanceId.slice(0, 6)})`,
   };
   return identityCache;
+}
+
+// The signed-in address is the only thing that distinguishes one profile from
+// another in terms the user can act on: an instanceId prefix names a profile
+// they cannot recognize, and picking the wrong one files their tab groups —
+// which Chrome 129+ auto-saves and syncs — into the wrong Google account.
+//
+// getProfileUserInfo needs no OAuth prompt and answers {} on a signed-out
+// profile, so a missing email is a normal result rather than a failure.
+async function profileEmail() {
+  try {
+    const info = await chrome.identity.getProfileUserInfo({ accountStatus: "ANY" });
+    return info?.email || null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // ---------- pairing (switch_browser) ----------

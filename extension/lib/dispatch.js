@@ -19,9 +19,14 @@ async function selfIdentity() {
   let platform = "unknown";
   try { platform = (await chrome.runtime.getPlatformInfo()).os; } catch (_) {}
   const deviceId = stored.instanceId || "unknown";
+  let email = null;
+  try {
+    email = (await chrome.identity.getProfileUserInfo({ accountStatus: "ANY" }))?.email || null;
+  } catch (_) {}
   return {
     deviceId,
-    name: stored.browserName || `Chrome (${platform}, ${String(deviceId).slice(0, 6)})`,
+    name: stored.browserName || email || `Chrome (${platform}, ${String(deviceId).slice(0, 6)})`,
+    ...(email ? { email } : {}),
     platform,
     extensionVersion: chrome.runtime.getManifest().version,
   };

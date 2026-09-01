@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Chrome Agent Bridge",
-  "version": "1.1.1",
+  "version": "1.2.0",
   "description": "Lets local AI agents (Claude Cowork / Claude Code via MCP) drive Chrome in the background inside isolated, reconnectable tab groups.",
   "minimum_chrome_version": "116",
   "background": {
@@ -16,7 +16,9 @@
     "storage",
     "alarms",
     "downloads",
-    "notifications"
+    "notifications",
+    "identity",
+    "identity.email"
   ],
   "host_permissions": ["<all_urls>"],
   "action": {
