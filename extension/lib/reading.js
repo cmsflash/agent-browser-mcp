@@ -7,7 +7,7 @@
 // fill/etc. calls until the page navigates. Navigation replaces the isolated
 // world, so refs from a previous page simply fail to resolve ("stale ref").
 //
-// Ref format is aligned with claude-in-chrome: "ref_1", "ref_2", …
+// Ref format: "ref_1", "ref_2", …
 
 // ---------- injection helper ----------
 
@@ -341,8 +341,7 @@ function locateElement(ref, selector, scrollIntoView) {
 // ---------- injected: plain text ----------
 
 function pageText(maxChars, offset) {
-  // Prefer article-ish content when the page has it (aligned with the
-  // official get_page_text, which prioritizes article content).
+  // Prefer article content when the page has it.
   const article = document.querySelector("article, [role=main], main");
   const source = article && (article.innerText || "").length > 500 ? article : document.body;
   const raw = (source ? source.innerText : "").replace(/\n{3,}/g, "\n\n");
@@ -491,7 +490,7 @@ function findElements(query, maxResults) {
 // ---------- exported tool implementations ----------
 
 export async function readPage(tabId, params = {}) {
-  // aligned names (filter/max_chars/depth/ref_id) with legacy fallbacks
+  // Parameter names (filter/max_chars/depth/ref_id) with legacy fallbacks.
   const filter = params.filter || (params.mode === "interactive" ? "interactive" : params.mode === "full" ? "all" : "all");
   const maxChars = params.max_chars ?? params.maxChars ?? 50000;
   const depth = params.depth ?? 15;

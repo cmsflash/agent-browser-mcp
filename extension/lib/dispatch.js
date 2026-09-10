@@ -1,6 +1,6 @@
 // Command dispatch: maps bridge-protocol methods to implementations.
 //
-// v1.1.0 speaks the claude-in-chrome-aligned protocol AND keeps every 1.0.x
+// v1.1.0 keeps every 1.0.x
 // method name as an alias, so live sessions running an older server keep
 // working after the extension reloads.
 
@@ -41,22 +41,21 @@ async function requireTab(params) {
   return params.tabId;
 }
 
-// modifiers: aligned string form ("ctrl+shift") or legacy array (["ctrl"])
+// Modifiers accept a string ("ctrl+shift") or a legacy array (["ctrl"]).
 function normalizeModifiers(m) {
   if (!m) return [];
   if (Array.isArray(m)) return m;
   return String(m).split("+").map((s) => s.trim()).filter(Boolean);
 }
 
-// The unified coordinate/keyboard tool, aligned with claude-in-chrome's
-// computer tool (ref targeting, zoom, scroll_to, hover, key sequences) plus
-// chrome-agent's extra raw primitives.
+// The unified coordinate/keyboard tool supports ref targeting, zoom,
+// scroll_to, hover, key sequences, and raw input primitives.
 async function computer(params) {
   const tabId = await requireTab(params);
   const { action } = params;
   const modifiers = normalizeModifiers(params.modifiers);
 
-  // clicks accept ref as an alternative to coordinate (aligned)
+  // Clicks accept ref as an alternative to coordinate.
   const point = async (required = true) => {
     if (Array.isArray(params.coordinate) && params.coordinate.length === 2) {
       return { x: params.coordinate[0], y: params.coordinate[1] };
@@ -143,7 +142,7 @@ async function computer(params) {
     case "key": {
       if (!params.text) throw new Error('key requires text, e.g. "Enter", "cmd+a", or "Backspace Backspace"');
       const repeat = Math.min(Math.max(params.repeat || 1, 1), 100);
-      // aligned: space-separated SEQUENCE of keys/chords, repeated `repeat` times.
+      // Space-separated sequence of keys/chords, repeated `repeat` times.
       // A literal/lone space means the space BAR (parseChord would trim it away).
       const sequence = /^\s+$/.test(params.text) ? ["space"] : params.text.split(/\s+/).filter(Boolean);
       for (let i = 0; i < repeat; i++) {

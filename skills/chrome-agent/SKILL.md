@@ -67,7 +67,7 @@ actually removes it. Abandoned workspaces are also reclaimed after 24h.
   editors/autocomplete), `form_input {ref, value}`, `drag_and_drop`
   (`method: "html5"` for DataTransfer UIs), `file_upload {paths, ref}`,
   `upload_image {imageId, ref|coordinate}`.
-- **Coordinates / keyboard:** `computer` — the full official action set
+- **Coordinates / keyboard:** `computer` — supported actions
   (`left_click`, `right_click`, `double_click`, `triple_click`, `type`, `key`
   with space-separated sequences like `"Backspace Backspace"` and chords like
   `"cmd+a"`, `scroll`, `left_click_drag`, `hover`, `scroll_to {ref}`, `wait`,

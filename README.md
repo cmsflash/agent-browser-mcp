@@ -1,6 +1,6 @@
 # Chrome Agent Bridge
 
-A self-owned clone of the Claude-in-Chrome integration that works with **Claude
+An MCP bridge for Chrome that works with **Claude
 Cowork**, Claude Code, and any MCP client. It drives your real, logged-in
 Chrome **in the background** — each agent thread is confined to its own
 **private tab group** while you keep using your machine (and Chrome) normally.
@@ -88,8 +88,7 @@ rather than silently routed to the wrong Chrome profile.
 touch no tabs). `select_browser` / `switch_browser` take it too, because the
 chosen browser is remembered per thread rather than per process.
 
-Names and parameters otherwise track the official claude-in-chrome MCP. The
-deliberate divergences: the mandatory `threadTitle`; no tab-group management
+The bridge uses a mandatory `threadTitle`; no tab-group management
 (agents never name or switch groups — the group is infrastructure);
 **`delete_my_tabs` instead of closing tabs** (Chrome auto-saves closed tab
 groups, so "close" always leaves a synced saved-group behind); and the window
@@ -105,7 +104,7 @@ a new one, because even an unfocused new window is a user-visible event.
 `list_connected_browsers` · `select_browser` · `switch_browser` ·
 `shortcuts_list` · `shortcuts_execute`
 
-Plus the chrome-agent extension layer:
+Workspace and interaction utilities:
 
 `get_status` · `delete_my_tabs` · `new_tab` · `list_tabs` · `close_tab` ·
 `bring_to_foreground` · `screenshot` (fullPage/element + imageId) ·
@@ -154,7 +153,7 @@ node background-guarantee.mjs   # OS-level focus-steal check
 # against your real, logged-in Chrome (creates + deletes its own tab group)
 node smoke-real.mjs             # connect, browse, screenshot, click, cleanup
 node reconnect-real.mjs         # agent restarts, re-attaches by threadTitle
-node aligned-real.mjs           # tabs_context/zoom/batch/gif/resize/browsers
+node tools-real.mjs             # tabs_context/zoom/batch/gif/resize/browsers
 node thread-isolation-real.mjs  # 25 assertions: isolation + delete, self-cleaning
 node frontmost-real.mjs         # macOS frontmost check in the real profile
 ```

@@ -1,4 +1,4 @@
-// Live check of the aligned tool surface against the user's real Chrome:
+// Live check of browser tools against the user's real Chrome:
 // tabs_context/tabs_create, read_page/find, computer zoom, browser_batch,
 // javascript REPL, gif_creator, resize_window, browsers, close_tab.
 //
@@ -7,8 +7,8 @@
 import { existsSync, readFileSync, unlinkSync } from "node:fs";
 import { connect, mkCall, selectTargetBrowser, requireVersion } from "./real-harness.mjs";
 
-const TH = "aligned-real check";
-const client = await connect("aligned-real");
+const TH = "tools-real check";
+const client = await connect("tools-real");
 const call = mkCall(client, TH);
 const out = [];
 const step = (n, ok, d = "") => { out.push(`${ok ? "✅" : "❌"} ${n}${d ? " — " + d : ""}`); };
@@ -52,7 +52,7 @@ try {
   await call("computer", { tabId: tab.tabId, action: "scroll", coordinate: [400, 300], scroll_direction: "down", scroll_amount: 2 });
   await call("navigate", { url: "https://example.com", tabId: tab.tabId });
   const stop = (await call("gif_creator", { tabId: tab.tabId, action: "stop_recording" })).json;
-  const exp = (await call("gif_creator", { tabId: tab.tabId, action: "export", filename: "aligned-real-check" })).json;
+  const exp = (await call("gif_creator", { tabId: tab.tabId, action: "export", filename: "tools-real-check" })).json;
   const isGif = exp.path && existsSync(exp.path) && readFileSync(exp.path).subarray(0, 6).toString("ascii") === "GIF89a";
   step("gif_creator records + exports a real GIF", stop.frames >= 2 && exp.exported && isGif, `${exp.frames} frames, ${Math.round((exp.sizeBytes || 0) / 1024)}KB`);
   if (exp.path && existsSync(exp.path)) unlinkSync(exp.path);

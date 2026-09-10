@@ -1,9 +1,7 @@
 // MCP tool definitions for the Chrome Agent Bridge — v1.1.0.
 //
-// The primary surface is a VERBATIM alignment with the official
-// claude-in-chrome MCP (22 tools: same names, same parameter schemas, same
-// semantics). On top of that, chrome-agent keeps its durable tab-group layer
-// and a few power tools as extensions.
+// Tool definitions cover browser interaction, durable tab groups,
+// and additional browser utilities.
 //
 // Design contract:
 //   * ENFORCED: exactly one tab group per agent thread. Every tool takes a
@@ -42,11 +40,11 @@ const refProp = {
   ref: { type: "string", description: 'Element reference ID from read_page or find tools (e.g., "ref_1", "ref_2"). Refs go stale after navigation — re-read the page if a ref fails.' },
 };
 const selectorProp = {
-  selector: { type: "string", description: "CSS selector, used if ref is not given (chrome-agent extension)." },
+  selector: { type: "string", description: "CSS selector, used if ref is not given." },
 };
 
 // ═══════════════════════════════════════════════════════════════════
-// ALIGNED SURFACE — identical to claude-in-chrome
+// BROWSER TOOLS
 // ═══════════════════════════════════════════════════════════════════
 
 tool(
@@ -79,7 +77,7 @@ tool(
   {
     action: {
       type: "string",
-      description: "The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key or space-separated sequence of keys.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.\nAdditional chrome-agent primitives: `middle_click`, `left_mouse_down`, `left_mouse_up`, `hold_key`, `cursor_position`.",
+      description: "The action to perform:\n* `left_click`: Click the left mouse button at the specified coordinates.\n* `right_click`: Click the right mouse button at the specified coordinates to open context menus.\n* `double_click`: Double-click the left mouse button at the specified coordinates.\n* `triple_click`: Triple-click the left mouse button at the specified coordinates.\n* `type`: Type a string of text.\n* `screenshot`: Take a screenshot of the screen.\n* `wait`: Wait for a specified number of seconds.\n* `scroll`: Scroll up, down, left, or right at the specified coordinates.\n* `key`: Press a specific keyboard key or space-separated sequence of keys.\n* `left_click_drag`: Drag from start_coordinate to coordinate.\n* `zoom`: Take a screenshot of a specific region for closer inspection.\n* `scroll_to`: Scroll an element into view using its element reference ID from read_page or find tools.\n* `hover`: Move the mouse cursor to the specified coordinates or element without clicking. Useful for revealing tooltips, dropdown menus, or triggering hover states.\nRaw input actions: `middle_click`, `left_mouse_down`, `left_mouse_up`, `hold_key`, `cursor_position`.",
       enum: ["left_click", "right_click", "type", "screenshot", "wait", "scroll", "key", "left_click_drag", "double_click", "triple_click", "zoom", "scroll_to", "hover", "middle_click", "left_mouse_down", "left_mouse_up", "hold_key", "cursor_position"],
     },
     coordinate: { type: "array", items: { type: "number" }, description: "(x, y): The x (pixels from the left edge) and y (pixels from the top edge) coordinates. Required for `left_click`, `right_click`, `double_click`, `triple_click`, and `scroll`. For `left_click_drag`, this is the end position." },
@@ -116,8 +114,8 @@ tool(
   "Extract raw text content from the page, prioritizing article content. Ideal for reading articles, blog posts, or other text-heavy pages. Returns plain text without HTML formatting. If you don't have a valid tab ID, use tabs_context_mcp first to get available tabs.",
   {
     ...tabIdReq("to extract text from"),
-    maxChars: { type: "number", description: "Max characters per call (default 16000; chrome-agent extension)." },
-    offset: { type: "number", description: "Character offset to continue from (default 0; chrome-agent extension)." },
+    maxChars: { type: "number", description: "Max characters per call (default 16000)." },
+    offset: { type: "number", description: "Character offset to continue from (default 0)." },
   },
   { required: ["tabId"] }
 );
@@ -301,7 +299,7 @@ tool(
 );
 
 // ═══════════════════════════════════════════════════════════════════
-// CHROME-AGENT EXTENSIONS — durable tab groups & power tools
+// WORKSPACE AND INTERACTION UTILITIES
 // ═══════════════════════════════════════════════════════════════════
 
 tool(

@@ -263,7 +263,7 @@ export async function executeJavascript(tabId, { code, awaitPromise = true, retu
     awaitPromise,
     userGesture: true,
     timeout: budget,
-    // REPL semantics (aligned with javascript_tool): top-level await works
+    // REPL semantics: top-level await works
     // and the last expression's value is returned.
     replMode,
   }, { timeoutMs: budget + 5000 });

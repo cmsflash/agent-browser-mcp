@@ -127,7 +127,7 @@ async function call(client, name, args = {}) {
   return { isError: !!res.isError, json, image: imagePart, text: textPart?.text || "", content: res.content || [] };
 }
 
-// aligned javascript_tool wrapper (REPL semantics)
+// javascript_tool wrapper (REPL semantics)
 async function js(client, tabId, code) {
   return call(client, "javascript_tool", { action: "javascript_exec", text: code, tabId });
 }
@@ -207,10 +207,10 @@ try {
   check("navigate forward works", fwd.url.includes("second.html"));
   await call(client1, "navigate", { tabId: tabA, url: "back" });
 
-  // ---------------- reading (aligned read_page/find) ----------------
+  // ---------------- reading (read_page/find) ----------------
   section("Reading");
   const rp = (await call(client1, "read_page", { tabId: tabA, filter: "interactive" })).json;
-  check("read_page returns outline with aligned refs", /\[ref=ref_\d+\]/.test(rp.outline || ""), (rp.outline || "").slice(0, 200));
+  check("read_page returns outline with ref_N references", /\[ref=ref_\d+\]/.test(rp.outline || ""), (rp.outline || "").slice(0, 200));
   check("read_page sees Increment button", /button "?Increment/i.test(rp.outline || ""));
   check("interactive filter hides ghost + text nodes", !/Ghost button/.test(rp.outline) && !/^text:/m.test(rp.outline));
 
@@ -321,9 +321,9 @@ try {
   const range = (await call(client1, "form_input", { tabId: tabA, selector: "#range", value: 80 })).json;
   check("form_input range", range.value === "80", JSON.stringify(range));
 
-  // ---------------- computer (aligned) ----------------
-  section("Computer (aligned actions)");
-  // scroll_to by ref (aligned: computer action, not a standalone tool)
+  // ---------------- computer ----------------
+  section("Computer actions");
+  // scroll_to by ref through the computer tool
   const bottomRef = (await call(client1, "find", { tabId: tabA, query: "#bottomMarker" })).json.results?.[0]?.ref;
   // #bottomMarker is a <p> — find's selector path only refs visible elements of any kind
   const stRes = bottomRef
@@ -340,17 +340,17 @@ try {
   const after = Number((await js(client1, tabA, "document.querySelector('#count').textContent")).json.result);
   check("computer left_click by coordinates", after === before + 1, `${before} -> ${after}`);
 
-  // click by REF through the computer tool (aligned alternative to coordinate)
+  // Click by ref through the computer tool.
   await call(client1, "computer", { tabId: tabA, action: "left_click", ref: incRef });
   const afterRef = Number((await js(client1, tabA, "document.querySelector('#count').textContent")).json.result);
   check("computer left_click by ref", afterRef === after + 1, `${after} -> ${afterRef}`);
 
-  // modifiers as aligned STRING form
+  // Modifiers as a string.
   await call(client1, "computer", { tabId: tabA, action: "left_click", coordinate: [cx, cy], modifiers: "shift" });
   const modLog = (await js(client1, tabA, "document.querySelector('#clickLog').textContent")).json.result || "";
   check("computer modifiers string ('shift')", /shift=true/.test(modLog.split("\n").slice(-3).join("\n")), modLog.split("\n").slice(-2).join(" | "));
 
-  // hover (aligned action)
+  // hover
   const hov = (await call(client1, "computer", { tabId: tabA, action: "hover", coordinate: [cx, cy] })).json;
   check("computer hover", hov.done === true);
 
@@ -399,7 +399,7 @@ try {
   const cshot = await call(client1, "computer", { tabId: tabA, action: "screenshot" });
   check("computer screenshot returns image", cshot.image?.mimeType === "image/jpeg");
 
-  // zoom (aligned): magnified region capture
+  // zoom: magnified region capture
   const zoom = await call(client1, "computer", { tabId: tabA, action: "zoom", region: [0, 80, 300, 240] });
   const zoomMeta = zoom.json || {};
   check("computer zoom returns magnified region", !!zoom.image && zoomMeta.zoom?.magnification > 1, JSON.stringify(zoomMeta.zoom));
@@ -433,7 +433,7 @@ try {
   const upBad = await call(client1, "upload_image", { tabId: tabA, imageId: "img_9999", ref: fiRef });
   check("upload_image unknown imageId errors helpfully", upBad.isError && /Unknown imageId/.test(upBad.text));
 
-  // ---------------- wait_for / console / network (aligned) ----------------
+  // ---------------- wait_for / console / network ----------------
   section("Async, console, network");
   await call(client1, "click", { tabId: tabA, selector: "#delayed" });
   const wf = await call(client1, "wait_for", { tabId: tabA, text: "DELAYED_CONTENT_READY", timeoutMs: 5000 });
@@ -454,7 +454,7 @@ try {
   const consNone = (await call(client1, "read_console_messages", { tabId: tabA, pattern: "zzz-no-match-zzz" })).json;
   check("pattern excludes non-matching", (consNone.messages || []).length === 0);
 
-  // official parity: console messages are per-domain — a cross-origin
+  // Console messages are per-domain — a cross-origin
   // navigation (127.0.0.1 -> localhost) clears the buffer
   await js(client1, tabA, "console.log('cross-domain-marker-999')");
   await sleep(200);
@@ -476,7 +476,7 @@ try {
     check("get_response_body returns json", false, "no request found");
   }
 
-  // ---------------- javascript_tool (aligned REPL) ----------------
+  // ---------------- javascript_tool (REPL) ----------------
   section("javascript_tool");
   const js1 = (await js(client1, tabA, "6 * 7")).json;
   check("returns last expression", js1.result === "42", JSON.stringify(js1));
@@ -510,7 +510,7 @@ try {
     check("clicking a zero-size ref errors (no (0,0) click)", false, "no ghost ref");
   }
 
-  // ---------------- browser_batch (aligned) ----------------
+  // ---------------- browser_batch ----------------
   section("browser_batch");
   const batch = await call(client1, "browser_batch", {
     actions: [
@@ -544,7 +544,7 @@ try {
   });
   check("batch cannot nest", /cannot be nested/.test(batchNested.content.map((c) => c.text).join("")));
 
-  // ---------------- gif_creator (aligned) ----------------
+  // ---------------- gif_creator ----------------
   section("gif_creator");
   await call(client1, "wait_for", { tabId: tabA, selector: "#inc", timeoutMs: 5000 });
   const gifStart = (await call(client1, "gif_creator", { tabId: tabA, action: "start_recording" })).json;
@@ -578,7 +578,7 @@ try {
   check("set_viewport applies", vw.result === "500", JSON.stringify(vw));
   await call(client1, "set_viewport", { tabId: tabA, clear: true });
 
-  // ---------------- browsers & shortcuts (aligned) ----------------
+  // ---------------- browsers & shortcuts ----------------
   section("Browsers & shortcuts");
   const browsers = (await call(client1, "list_connected_browsers")).json;
   check("list_connected_browsers shows this browser", (browsers.browsers || []).length === 1 && !!browsers.browsers[0].deviceId, JSON.stringify(browsers));
@@ -618,7 +618,7 @@ try {
   const closeOwn2 = (await call(client2, "close_tab", { tabId: c2b.tabId })).json;
   check("closing own tab works", closeOwn2.closed === true);
 
-  // navigate standalone with NO tab: auto-context (aligned)
+  // navigate standalone with NO tab: auto-context
   client3 = await newClient("e2e-thread-3");
   await sleep(300);
   const reloadNoTab = await call(client3, "navigate", { url: "reload" });

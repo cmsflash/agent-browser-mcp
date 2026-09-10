@@ -1,8 +1,7 @@
 #!/usr/bin/env node
 // Chrome Agent Bridge — MCP server (stdio), v1.1.0.
 //
-// One process per agent thread. The tool surface is aligned verbatim with the
-// official claude-in-chrome MCP, plus the durable tab-group extension layer.
+// One process per agent thread, with browser tools and durable tab groups.
 // This file owns per-session state
 // (current group/tab, selected browser, screenshot image cache) and the
 // server-side composites: browser_batch, gif export encoding, upload_image,
@@ -84,7 +83,7 @@ function applySessionDefaults(name, args, { inBatch = false } = {}) {
   const wantsTab = "tabId" in (byName[name]?.inputSchema?.properties || {});
   if (wantsTab && !NO_TAB_DEFAULT.has(name) && a.tabId == null && !inBatch) {
     const known = currentTab.get(thread);
-    if (known != null) a.tabId = known; // aligned: inside a batch, tabId must be explicit
+    if (known != null) a.tabId = known; // Inside a batch, tabId must be explicit.
   }
   return a;
 }

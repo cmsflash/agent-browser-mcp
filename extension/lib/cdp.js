@@ -143,15 +143,14 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
   switch (method) {
     case "Page.frameNavigated": {
-      // Aligned with claude-in-chrome: the network buffer clears when the
-      // page navigates to a different domain.
+      // Clear the network buffer when the page navigates to a different origin.
       if (!params.frame || params.frame.parentId) break; // main frame only
       let origin = "";
       try { origin = new URL(params.frame.url).origin; } catch (_) {}
       if (s.lastOrigin && origin && s.lastOrigin !== origin) {
         s.network.clear();
         s.networkOrder = [];
-        s.console = []; // official parity: messages are "from the current domain only"
+        s.console = []; // Keep messages from the current origin only.
       }
       if (origin) s.lastOrigin = origin;
       break;
