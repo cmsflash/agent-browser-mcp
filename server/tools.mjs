@@ -289,7 +289,7 @@ tool(
 
 tool(
   "shortcuts_execute",
-  "Execute a shortcut or workflow by running its steps on the given tab (shortcuts and workflows are interchangeable). Use shortcuts_list first to see available shortcuts. This starts the execution and returns immediately - it does not wait for completion.",
+  "Submit a shortcut or workflow to run on the given tab. Use shortcuts_list first to see available shortcuts. Returns immediately with submission status, not completion. After this call returns, MCP cancellation cannot stop its background steps; already-dispatched browser actions may still apply.",
   {
     shortcutId: { type: "string", description: "The ID of the shortcut to execute" },
     command: { type: "string", description: "The command name of the shortcut to execute (e.g., 'debug', 'summarize'). Do not include the leading slash." },
@@ -304,8 +304,8 @@ tool(
 
 tool(
   "get_status",
-  "Health check: is the Chrome extension connected, and which browser is selected for your thread. Call this first if other tools fail. With more than one profile connected and nothing selected yet, this returns the candidate browsers (with their signed-in emails) instead of guessing — you must then call select_browser.",
-  {},
+  "Report connection state, retained browser selection, configured profile constraint, and server safety capabilities. Unavailable selections remain pinned; another profile is never substituted. If selection is ambiguous, ask the user which permitted profile to use.",
+  { threadTitle: { type: "string", description: "Thread whose retained selection to inspect. Omit for the browser-wide utility selection." } },
   { method: "status", threadless: true }
 );
 

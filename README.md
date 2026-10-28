@@ -63,10 +63,7 @@ free. Two things do not update themselves:
 - **The extension** — reload it per profile at `chrome://extensions`, or call the
   `reload_extension` tool once per profile.
 
-Agent sessions already running keep their own older MCP process until their app
-restarts. That is safe rather than merely tolerated: the hub does not trust a
-stale relay's browser choice (see below), so an outdated session is refused
-rather than silently routed to the wrong Chrome profile.
+Agent sessions already running keep their older MCP code until their app restarts; server-side safety changes do not retrofit those processes. Upgraded relays can reuse a compatible hub's acknowledged exact-device routing. An unsupported or mismatched selection acknowledgment is refused rather than guessed. Roll out changes to other live owners only with their operator's approval.
 
 ## The contract
 
@@ -120,6 +117,30 @@ Shortcuts are user-defined in `chrome.storage.local` under `shortcuts`:
 `[{id, command, description, isWorkflow, steps: [{name, input}]}]` with
 `"$TAB"` as the target-tab placeholder in step inputs.
 
+## Server profile and caller isolation
+
+For an isolated companion, configure the server process, not tool arguments:
+
+```bash
+CHROME_AGENT_PROFILE_EMAIL='work@example.test' \
+DSH_REMOTE_CONTEXT_ID='host-resolved-peer-and-caller-id' \
+node server/index.mjs
+```
+
+- `CHROME_AGENT_PROFILE_EMAIL` is an optional exact, case-insensitive match against the extension's reported profile email. A configured empty value is an error. Automatic and explicit selection cannot choose another reported profile. This is a Chrome-profile routing constraint, not proof of the account signed into a website.
+- A selected device stays pinned for that exact thread until an explicit successful `select_browser` or `switch_browser`. Disconnects never discard the pin, retry the action, or substitute the sole remaining profile. Pins are process-local; use the profile constraint for companion restarts. At 200 retained selections, new selections fail instead of evicting old pins.
+- `DSH_REMOTE_CONTEXT_ID` is an optional trusted, opaque caller identity. A configured empty value is an error. The server derives `dsh-<128-bit SHA-256 prefix>-` from it and adds a lowercased, bounded display suffix, keeping the complete title within Chrome's 60 UTF-16-code-unit limit. Explicit nested batch titles receive the same caller prefix; omitted nested titles inherit the parent. Threadless utilities use a namespaced `global` key. Model titles never choose the prefix. Pass ordinary titles from the gateway; do not pre-prefix them. Omission preserves local title behavior.
+
+MCP initialization advertises `capabilities.experimental["chrome-agent/safety"]`; `get_status` also returns it as `safety`. Version `1` reports `stickyDevicePin`, `exactProfileEmail`, `callerNamespace: 1`, the configured `requiredProfileEmail`, and `remoteContextConfigured`/`remoteContextHash`. `get_status` accepts an optional `threadTitle`; `connected` reports available browser connections and `ready` reports whether that selection can be used.
+
+### Cancellation and compatibility
+
+MCP cancellation reaches connection waits, pairing waits, outstanding bridge waits, and the boundaries between batch actions. A failed or cancelled batch returns `isError: true`, keeps earlier step output, and reports `_meta["chrome-agent/error"]` with a `code` and `outcome`. `not-dispatched` means no browser command was sent for the failed request; `unknown` means a sent command may still apply. The server never automatically replays a browser command, and cancellation is not rollback. GIF encoding yields between frames and checks cancellation before saving or requesting a browser download.
+
+`shortcuts_execute` retains its existing fire-and-forget behavior: `started` acknowledges submission, not completion. Its result and `_meta["chrome-agent/submission"]` explicitly report `submissionOnly: true` and `cancellableAfterReturn: false`. Once its MCP call returns, later MCP cancellation cannot stop its background steps. The safety marker therefore reports `cancellation: "server-boundaries"`, `extensionAbort: false`, and `shortcuts: "submission-only"`.
+
+No extension changes are required for these server guarantees. A compatible older shared hub can remain running: the relay requires acknowledgment of the exact selected device and reported profile before sending an explicitly device-addressed command. Missing or mismatched acknowledgments fail closed. Updated hubs additionally check the profile at socket dispatch and accept relay cancellation. An older hub can still finish a command already forwarded to it; cancellation of that request remains `unknown`. Do not reload a live hub or extension just to run the fake tests below.
+
 ## Security notes
 
 - The hub binds `127.0.0.1` only.
@@ -131,11 +152,18 @@ Shortcuts are user-defined in `chrome.storage.local` under `shortcuts`:
   connected, a thread that has not chosen one is refused (with both accounts
   named) instead of being pointed at whichever extension reconnected last.
   Picking wrong is not a cosmetic error: Chrome 129+ auto-saves tab groups, so
-  a misrouted group syncs into the wrong Google account. The hub also ignores a
-  `deviceId` from a relay that never explicitly selected it, which is what keeps
-  an older, still-running agent session from silently re-introducing the guess.
+  a misrouted group syncs into the wrong Google account. The updated hub refuses unselected ambiguous relay choices and retains each relay thread's accepted device. An ordinary request cannot change that device; an explicit selection control is required.
 
 ## Testing
+
+Fake Node/MCP/WebSocket tests use only owned in-memory transports and ephemeral loopback ports, without Chrome or the live hub:
+
+```bash
+npm ci --ignore-scripts --prefix server
+node --test test/session-safety.mjs test/bridge-safety.mjs
+```
+
+The browser suites below are separate and require explicit browser access:
 
 ```bash
 cd test
@@ -166,7 +194,7 @@ connected they use it; with several they fail and ask for `CAB_TEST_BROWSER`
 CAB_TEST_BROWSER=you@example.com node smoke-real.mjs
 ```
 
-Tests need **Chrome for Testing**, and specifically a build that still honours
+The browser suites need **Chrome for Testing**, and specifically a build that still honours
 `--load-extension` (Chrome ≥137 ignores it, and newer Chrome-for-Testing builds
 do too, so `harness.mjs` picks the newest installed build **≤136** rather than
 the newest overall — otherwise every test fails with "extension never
@@ -222,10 +250,7 @@ older MCP server keeps working after the extension reloads. Reload with the
   profiles with many tabs; a fresh test browser never freezes anything.
 - **Branded Chrome ≥137 removed `--load-extension`** — automated tests use
   Chrome for Testing; real installs load the unpacked extension manually.
-- **The extension's reconnect backoff bounds first-call latency.** When a new
-  agent session starts, its server becomes the hub and the extension must
-  notice. The backoff is capped at 3 s and `bridge.call()` waits up to 15 s for
-  the link, so the first tool call of a session doesn't fail spuriously.
+- **Connection grace is cancellable, not permission to retarget.** The bridge can wait up to 15 seconds for a link. A missing initial eligible profile is reported unavailable; a lost existing pin is retained. Neither case authorizes using another connected profile.
 - **Agent groups join the profile's last-active window; they do not create one.**
   Even an unfocused `chrome.windows.create` is a user-visible event (a new entry
   in the window list, the Dock/taskbar and Mission Control), so agent tabs go

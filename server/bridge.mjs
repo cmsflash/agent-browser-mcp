@@ -1,432 +1,456 @@
-// WebSocket bridge between MCP server processes and Chrome extension(s).
-//
-// Every Claude Cowork / Claude Code thread spawns its own MCP server process
-// (stdio). The first process to bind 127.0.0.1:47120 becomes the HUB; later
-// processes detect the port is taken and become RELAYS that proxy their
-// commands through the hub. If the hub process exits, the extensions and the
-// relays both reconnect, and one relay wins the race to become the new hub.
-//
-// v1.1.0: the hub accepts MULTIPLE extension connections (different Chrome
-// profiles/channels each run their own copy of the extension). Each extension
-// identifies itself with a persistent instanceId ("deviceId") in its hello
-// message; sessions route calls to a selected browser (default: the most
-// recently connected). list/select/switch_browser are "hub:*" control ops.
-
+// Shared loopback hub/relay transport. Device routing never substitutes a lost pin.
 import { WebSocketServer, WebSocket } from "ws";
 import { randomUUID } from "node:crypto";
+import { BridgeError, SAFETY_CAPABILITIES, cancelled, checkCancelled, failureMetadata, normalizeProfileEmail, profileMatches, uncertain } from "./safety.mjs";
 
 export const DEFAULT_PORT = 47120;
+const MAX_PINS = 200;
+const log = (message) => process.stderr.write(`[chrome-agent] ${message}\n`);
+const scopeKey = (params) => {
+  if (params.threadTitle != null && typeof params.threadTitle !== "string") throw new BridgeError("INVALID_THREAD", "threadTitle must be a string.");
+  return params.threadTitle ?? null;
+};
 
-const log = (m) => process.stderr.write(`[chrome-agent] ${m}\n`);
-
-// Identify a browser the way the user thinks of it — by the account signed
-// into that profile. Extensions older than 1.2.0 send no email, so fall back
-// to the display name rather than printing "undefined".
 export function describeBrowser(info) {
-  const label = info.email || info.name || "unknown profile";
-  return `${label} — deviceId ${info.deviceId}`;
+  return `${info.email || info.name || "unknown profile"} — deviceId ${info.deviceId}`;
+}
+
+function pause(ms, signals) {
+  return new Promise((resolve, reject) => {
+    const listeners = [];
+    const finish = (error) => {
+      clearTimeout(timer);
+      for (const [signal, listener] of listeners) signal.removeEventListener("abort", listener);
+      if (error) reject(error); else resolve();
+    };
+    const timer = setTimeout(() => finish(), ms);
+    for (const signal of signals.filter(Boolean)) {
+      const listener = () => finish(cancelled(signal));
+      listeners.push([signal, listener]);
+      signal.addEventListener("abort", listener, { once: true });
+      if (signal.aborted) { listener(); break; }
+    }
+  });
 }
 
 export class Bridge {
   constructor(port = DEFAULT_PORT) {
     this.port = port;
-    this.mode = "starting"; // "hub" | "relay"
-    this.browsers = new Map(); // hub mode: deviceId -> {sock, info, connectedAt}
-    this.relaySocket = null;   // relay mode: socket to the hub
-    this.pending = new Map();  // id -> {resolve, reject, timer}
-    this.pairWaiters = [];     // hub mode: switch_browser resolvers
+    this.mode = "starting";
+    this.browsers = new Map();
+    this.relaySocket = null;
+    this.pending = new Map();
+    this.pairWaiters = new Set();
+    this.localPins = new Map();
+    this.sockets = new Set();
+    this.lifecycle = new AbortController();
     this.closed = false;
+    this.stopping = null;
   }
 
-  async start() {
-    await this.#tryBecomeHub();
+  start() {
+    this.starting ??= this.#tryBecomeHub();
+    return this.starting;
   }
 
-  async stop() {
+  stop() {
+    if (this.stopping) return this.stopping;
+    let finish;
+    this.stopping = new Promise((resolve) => { finish = resolve; });
     this.closed = true;
-    for (const [, p] of this.pending) {
-      clearTimeout(p.timer);
-      p.reject(new Error("bridge shutting down"));
+    this.lifecycle.abort();
+    clearTimeout(this.reconnectTimer);
+    clearInterval(this.pingTimer);
+    for (const pending of [...this.pending.values()]) {
+      pending.reject(pending.sent && pending.browserCommand
+        ? uncertain("BRIDGE_CLOSED", "The bridge stopped while awaiting a browser command.", pending.detail)
+        : new BridgeError("BRIDGE_CLOSED", "The bridge is shutting down.", pending.detail));
     }
-    this.pending.clear();
-    try { this.wss?.close(); } catch {}
-    try { this.relaySocket?.close(); } catch {}
-    for (const { sock } of this.browsers.values()) {
-      try { sock.close(); } catch {}
-    }
-    this.browsers.clear();
+    for (const waiter of [...this.pairWaiters]) waiter.reject(new BridgeError("BRIDGE_CLOSED", "The bridge is shutting down."));
+    const sockets = new Set([...this.sockets, ...[this.relaySocket].filter(Boolean)]);
+    const closed = [...sockets].map((socket) => new Promise((resolve) => {
+      if (socket.readyState === WebSocket.CLOSED) { resolve(); return; }
+      socket.once("close", resolve);
+      socket.terminate();
+    }));
+    const serverClosed = new Promise((resolve) => {
+      if (!this.wss) { resolve(); return; }
+      this.wss.close(() => resolve());
+    });
+    void Promise.all([...closed, serverClosed]).then(() => {
+      this.browsers.clear();
+      this.sockets.clear();
+      finish();
+    });
+    return this.stopping;
   }
-
-  // ---------- hub mode ----------
 
   #tryBecomeHub() {
-    // Never re-elect while closed or already the hub (a duplicate close/error
-    // event could otherwise make a live hub connect to ITSELF as a relay).
     if (this.closed || this.mode === "hub") return Promise.resolve();
     return new Promise((resolve) => {
       const wss = new WebSocketServer({ host: "127.0.0.1", port: this.port });
+      this.wss = wss;
+      wss.once("close", resolve);
       wss.once("listening", () => {
         this.wss = wss;
+        this.port = wss.address().port;
         this.mode = "hub";
-        log(`hub listening on ws://127.0.0.1:${this.port}`);
         this.#wireHub(wss);
+        log(`hub listening on ws://127.0.0.1:${this.port}`);
+        if (this.closed) wss.close();
         resolve();
       });
-      wss.once("error", (e) => {
-        if (e.code !== "EADDRINUSE") log(`hub error: ${e.message} — running as relay`);
-        else log(`port ${this.port} taken — running as relay`);
+      wss.once("error", (error) => {
+        log(error.code === "EADDRINUSE" ? `port ${this.port} taken — running as relay` : `hub error: ${error.message}`);
+        if (this.closed) { resolve(); return; }
         this.#connectRelay().then(resolve);
       });
     });
   }
 
   #wireHub(wss) {
-    wss.on("connection", (sock, req) => {
-      const path = (req.url || "/").split("?")[0];
-      const origin = req.headers.origin || "";
-      if (path === "/ext") {
-        // Only the Chrome extension may register as a browser: web pages can
-        // open ws://127.0.0.1 but cannot fake a chrome-extension:// origin.
-        if (!origin.startsWith("chrome-extension://")) {
-          log(`rejected /ext connection with origin "${origin}"`);
-          sock.close(4003, "extension origin required");
-          return;
-        }
-        this.#wireExtension(sock);
-      } else if (path === "/relay") {
-        // Browsers cannot set arbitrary headers on WebSocket handshakes, so
-        // requiring one shuts out random web pages.
-        if (req.headers["x-cab-relay"] !== "1") {
-          sock.close(4003, "relay header required");
-          return;
-        }
-        this.#wireRelayClient(sock);
-      } else {
-        sock.close(4004, "unknown path");
-      }
+    wss.on("connection", (socket, request) => {
+      this.sockets.add(socket);
+      socket.once("close", () => this.sockets.delete(socket));
+      const path = (request.url || "/").split("?")[0];
+      if (path === "/ext" && (request.headers.origin || "").startsWith("chrome-extension://")) this.#wireExtension(socket);
+      else if (path === "/relay" && request.headers["x-cab-relay"] === "1") this.#wireRelayClient(socket);
+      else socket.close(4003, "permitted bridge origin and path required");
     });
-
-    // keep the extensions' MV3 service workers alive while connected
     this.pingTimer = setInterval(() => {
       for (const { sock } of this.browsers.values()) {
-        try {
-          if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ method: "ping" }));
-        } catch {}
+        if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ method: "ping" }), () => {});
       }
     }, 20000);
     this.pingTimer.unref?.();
   }
 
-  #wireExtension(sock) {
-    // The socket is registered once its hello (with instanceId) arrives.
-    // Legacy extensions (< 1.1.0) send hello without an instanceId — they get
-    // a per-connection id so they still work.
+  #wireExtension(socket) {
     let deviceId = null;
-    sock.on("message", (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (msg.event === "hello") {
-        deviceId = msg.instanceId || `legacy-${randomUUID().slice(0, 8)}`;
-        const prev = this.browsers.get(deviceId);
-        if (prev && prev.sock !== sock) {
-          try { prev.sock.close(4000, "replaced by new connection from same browser"); } catch {}
+    socket.on("message", (data) => {
+      let message;
+      try { message = JSON.parse(data.toString()); } catch { return; }
+      if (!message || typeof message !== "object" || Array.isArray(message)) return;
+      if (message.event === "hello") {
+        const id = message.instanceId ?? deviceId ?? `legacy-${randomUUID().slice(0, 8)}`;
+        if (typeof id !== "string" || !id || (deviceId && deviceId !== id)) {
+          socket.close(4002, "browser identity cannot change on a connection");
+          return;
         }
-        this.browsers.set(deviceId, {
-          sock,
-          // First time this browser was EVER seen, not the latest reconnect.
-          // MV3 service workers redial on every wake, so a live timestamp
-          // reshuffles the browsers on its own and makes any "most recent"
-          // choice a coin flip between the user's profiles.
-          connectedAt: prev?.connectedAt ?? Date.now(),
+        deviceId = id;
+        const previous = this.browsers.get(id);
+        if (previous && previous.sock !== socket) previous.sock.close(4000, "replaced by same browser connection");
+        this.browsers.set(id, {
+          sock: socket,
+          connectedAt: previous?.connectedAt ?? Date.now(),
           info: {
-            deviceId,
-            name: msg.name || msg.email || `Chrome (${deviceId.slice(0, 8)})`,
-            ...(msg.email ? { email: msg.email } : {}),
-            platform: msg.platform || "unknown",
-            extensionVersion: msg.version || "unknown",
+            deviceId: id,
+            name: typeof message.name === "string" ? message.name : typeof message.email === "string" ? message.email : `Chrome (${id.slice(0, 8)})`,
+            ...(typeof message.email === "string" && message.email ? { email: message.email } : {}),
+            platform: typeof message.platform === "string" ? message.platform : "unknown",
+            extensionVersion: typeof message.version === "string" ? message.version : "unknown",
           },
         });
-        log(`browser connected: ${deviceId} (v${msg.version || "?"})`);
+        log(`browser connected: ${id}`);
         return;
       }
-      if (msg.event === "pair") {
-        // user clicked Connect in this browser's popup/notification
+      if (message.event === "pair") {
         const entry = deviceId && this.browsers.get(deviceId);
-        if (entry) {
-          for (const w of this.pairWaiters.splice(0)) w.resolve(entry.info);
+        if (entry?.sock === socket) {
+          for (const waiter of [...this.pairWaiters]) {
+            if (waiter.devices.has(deviceId) && profileMatches(entry.info, waiter.profileEmail)) waiter.resolve(entry.info);
+          }
         }
         return;
       }
-      if (msg.method === "pong" || msg.event) return;
-      if (msg.id && this.pending.has(msg.id)) {
-        const p = this.pending.get(msg.id);
-        this.pending.delete(msg.id);
-        clearTimeout(p.timer);
-        if (msg.ok) p.resolve(msg.result);
-        else p.reject(new Error(msg.error || "extension error"));
+      if (message.method === "pong" || message.event) return;
+      const pending = this.pending.get(message.id);
+      if (!pending || pending.sock !== socket) return;
+      if (message.ok) pending.resolve(message.result);
+      else pending.reject(uncertain("EXTENSION_ERROR", message.error || "The extension returned an error.", pending.detail));
+    });
+    socket.on("close", () => {
+      if (deviceId && this.browsers.get(deviceId)?.sock === socket) this.browsers.delete(deviceId);
+      for (const pending of [...this.pending.values()]) {
+        if (pending.sock === socket) pending.reject(uncertain("BROWSER_DISCONNECTED", "The selected browser disconnected mid-call.", pending.detail));
       }
     });
-    sock.on("close", () => {
-      if (deviceId && this.browsers.get(deviceId)?.sock === sock) {
-        this.browsers.delete(deviceId);
-        log(`browser disconnected: ${deviceId}`);
-      }
-      // fail fast instead of letting in-flight calls run out their timers
-      for (const [id, p] of [...this.pending]) {
-        if (p.sock === sock) {
-          this.pending.delete(id);
-          clearTimeout(p.timer);
-          p.reject(new Error("browser disconnected mid-call (extension reloaded or Chrome closed) — retry the call"));
-        }
-      }
-    });
-    sock.on("error", () => {});
+    socket.on("error", () => {});
   }
 
-  #wireRelayClient(sock) {
-    log("relay client connected");
-    // Which browsers THIS relay has explicitly selected (hub:select_browser /
-    // hub:switch_browser). A deviceId that never went through one of those is
-    // a guess the relay made locally, not a decision the user made.
-    const chosen = new Set();
-    sock.on("message", async (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (!msg.id || !msg.method) return;
+  #wireRelayClient(socket) {
+    const chosen = new Map();
+    const active = new Map();
+    socket.on("message", async (data) => {
+      let message;
+      try { message = JSON.parse(data.toString()); } catch { return; }
+      if (!message || typeof message !== "object" || Array.isArray(message)) return;
+      if (typeof message.cancel === "string") {
+        active.get(message.cancel)?.abort();
+        return;
+      }
+      if (!message.id || typeof message.method !== "string") return;
+      if (active.has(message.id)) return;
+      const control = new AbortController();
+      active.set(message.id, control);
       try {
-        const deviceId = this.#authorizeRelayDevice(msg, chosen);
-        const result = await this.call(msg.method, msg.params || {}, msg.timeoutMs, deviceId);
-        if (msg.method === "hub:select_browser" || msg.method === "hub:switch_browser") {
-          if (result?.selected?.deviceId) chosen.add(result.selected.deviceId);
+        const profileEmail = normalizeProfileEmail(message.profileEmail);
+        const deviceId = this.#authorizeRelayDevice(message, chosen, profileEmail);
+        const result = await this.call(message.method, message.params || {}, message.timeoutMs, deviceId, {
+          signal: control.signal, profileEmail, pins: chosen,
+        });
+        if (message.method === "hub:select_browser" || message.method === "hub:switch_browser") {
+          checkCancelled(control.signal);
+          this.#rememberPin(chosen, scopeKey(message.params || {}), result.selected.deviceId);
         }
-        if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ id: msg.id, ok: true, result }));
-      } catch (e) {
-        if (sock.readyState === WebSocket.OPEN) sock.send(JSON.stringify({ id: msg.id, ok: false, error: String(e.message || e) }));
-      }
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ id: message.id, ok: true, result }));
+      } catch (error) {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({
+          id: message.id, ok: false, error: String(error.message || error), failure: failureMetadata(error),
+        }));
+      } finally { active.delete(message.id); }
     });
-    sock.on("close", () => {});
-    sock.on("error", () => {});
+    socket.on("close", () => { for (const control of active.values()) control.abort(); });
+    socket.on("error", () => {});
   }
 
-  // A relay running pre-1.2.0 code picks a browser itself — by connection
-  // recency — and sends that deviceId down as though the user had chosen it.
-  // That silently defeats the ambiguity guard, and no warning helps: the agent
-  // on the other side cannot upgrade its own process.
-  //
-  // So the hub judges the CLAIM rather than the relay: a deviceId this relay
-  // never explicitly selected is treated as absent while more than one browser
-  // is connected, which routes it back into the normal refusal. With a single
-  // browser connected the guess cannot be wrong, so nothing changes.
-  #authorizeRelayDevice(msg, chosen) {
-    const deviceId = msg.deviceId;
-    if (!deviceId || chosen.has(deviceId)) return deviceId;
-    if (String(msg.method || "").startsWith("hub:")) return deviceId;
-    const open = [...this.browsers.values()].filter((e) => e.sock.readyState === WebSocket.OPEN);
-    return open.length > 1 ? null : deviceId;
+  #rememberPin(pins, key, deviceId) {
+    if (!pins.has(key) && pins.size >= MAX_PINS) throw new BridgeError("PIN_LIMIT", "Browser selection capacity reached; existing pins are retained.");
+    pins.set(key, deviceId);
   }
 
-  // ---------- relay mode ----------
+  #authorizeRelayDevice(message, chosen, profileEmail) {
+    if (message.method.startsWith("hub:")) return message.deviceId;
+    const key = scopeKey(message.params || {});
+    const selected = chosen.get(key);
+    if (selected && message.deviceId && selected !== message.deviceId) {
+      throw new BridgeError("PROFILE_PIN_CONFLICT", "This thread has a different pinned browser. Use explicit select_browser to change it.", { deviceId: selected });
+    }
+    if (selected) return selected;
+    const open = this.#openBrowsers(profileEmail);
+    // Old relays may guess by connection order. Only a sole candidate or a hub selection establishes a pin.
+    if (message.deviceId && open.length > 1) throw this.#ambiguous(open);
+    const target = message.deviceId || (open.length === 1 ? open[0].info.deviceId : null);
+    if (target) this.#rememberPin(chosen, key, target);
+    return target;
+  }
 
   #connectRelay() {
     this.mode = "relay";
     return new Promise((resolve) => {
       let settled = false;
-      const sock = new WebSocket(`ws://127.0.0.1:${this.port}/relay`, {
-        headers: { "x-cab-relay": "1" },
-      });
+      const socket = new WebSocket(`ws://127.0.0.1:${this.port}/relay`, { headers: { "x-cab-relay": "1" } });
+      this.relaySocket = socket;
       const settle = () => { if (!settled) { settled = true; resolve(); } };
-      sock.on("open", () => {
-        this.relaySocket = sock;
-        log("connected to hub as relay");
+      socket.on("open", () => {
+        if (this.closed) socket.terminate();
+        else log("connected to hub as relay");
         settle();
       });
-      sock.on("message", (data) => {
-        let msg;
-        try { msg = JSON.parse(data.toString()); } catch { return; }
-        if (msg.id && this.pending.has(msg.id)) {
-          const p = this.pending.get(msg.id);
-          this.pending.delete(msg.id);
-          clearTimeout(p.timer);
-          if (msg.ok) p.resolve(msg.result);
-          else p.reject(new Error(msg.error || "hub error"));
+      socket.on("message", (data) => {
+        let message;
+        try { message = JSON.parse(data.toString()); } catch { return; }
+      if (!message || typeof message !== "object" || Array.isArray(message)) return;
+        const pending = this.pending.get(message.id);
+        if (!pending || pending.sock !== socket) return;
+        if (message.ok) pending.resolve(message.result);
+        else {
+          const detail = message.failure;
+          const text = String(message.error || "Browser hub returned an error").replace(/\s*[—-]\s*retry the call\.?/gi, "");
+          pending.reject(detail?.code && (detail.outcome === "unknown" || detail.outcome === "not-dispatched")
+            ? new BridgeError(detail.code, text, detail)
+            : pending.browserCommand ? uncertain("HUB_ERROR", text, pending.detail) : new BridgeError("HUB_ERROR", text, pending.detail));
         }
       });
       let gone = false;
       const onGone = () => {
-        if (gone) return; // 'error' + 'close' both fire — run once
+        if (gone) return;
         gone = true;
-        if (this.relaySocket === sock) this.relaySocket = null;
-        for (const [, p] of this.pending) {
-          clearTimeout(p.timer);
-          p.reject(new Error("hub connection lost — retry the call"));
+        if (this.relaySocket === socket) this.relaySocket = null;
+        for (const pending of [...this.pending.values()]) {
+          if (pending.sock === socket) pending.reject(pending.browserCommand
+            ? uncertain("HUB_DISCONNECTED", "The browser hub connection was lost.", pending.detail)
+            : new BridgeError("HUB_DISCONNECTED", "The browser hub connection was lost.", pending.detail));
         }
-        this.pending.clear();
         settle();
-        if (!this.closed) {
-          // the hub may have died with its session — try to take over
-          setTimeout(() => this.#tryBecomeHub(), 250 + Math.random() * 500);
-        }
+        if (!this.closed) this.reconnectTimer = setTimeout(() => this.#tryBecomeHub(), 250 + Math.random() * 500);
       };
-      sock.on("close", onGone);
-      sock.on("error", onGone);
+      socket.on("close", onGone);
+      socket.on("error", onGone);
     });
   }
 
-  // ---------- browser selection helpers (hub mode) ----------
+  #openBrowsers(profileEmail = null) {
+    return [...this.browsers.values()].filter(entry => entry.sock.readyState === WebSocket.OPEN && profileMatches(entry.info, profileEmail));
+  }
 
-  #pickBrowser(deviceId) {
+  #ambiguous(open) {
+    return new BridgeError("PROFILE_SELECTION_REQUIRED",
+      `${open.length} Chrome profiles are eligible and none is selected — refusing to guess.\n` +
+      open.map(entry => `  • ${describeBrowser(entry.info)}`).join("\n") +
+      "\nAsk the user which profile to use, then call select_browser with its deviceId.");
+  }
+
+  #pickBrowser(deviceId, profileEmail) {
     if (deviceId) {
       const entry = this.browsers.get(deviceId);
       if (!entry || entry.sock.readyState !== WebSocket.OPEN) {
-        throw new Error(`Browser ${deviceId} is not connected. Use list_connected_browsers to see current ones.`);
+        throw new BridgeError("PROFILE_UNAVAILABLE", `Pinned browser ${deviceId} is not connected. Its selection was retained; reconnect it or explicitly select another permitted browser.`, { deviceId });
+      }
+      if (!profileMatches(entry.info, profileEmail)) {
+        throw new BridgeError("PROFILE_MISMATCH", "The selected browser does not match CHROME_AGENT_PROFILE_EMAIL; no browser command was dispatched.", { deviceId });
       }
       return entry;
     }
-    const open = [...this.browsers.values()].filter((e) => e.sock.readyState === WebSocket.OPEN);
-    if (!open.length) {
-      throw new Error(
-        "Chrome extension is not connected. Make sure Chrome is running and the 'Chrome Agent Bridge' extension is loaded and enabled (chrome://extensions). Click the extension icon → Reconnect if needed."
-      );
-    }
-    // With one browser there is nothing to get wrong. With several, every
-    // available tiebreak (connection order, recency) is an artifact of service
-    // workers waking up, NOT a statement of intent — and guessing wrong drives
-    // the wrong Google account, whose tab groups Chrome then saves and syncs
-    // there. Refuse, and name the options so the caller can choose.
-    if (open.length > 1) {
-      const list = open.map((e) => `  • ${describeBrowser(e.info)}`).join("\n");
-      throw new Error(
-        `${open.length} Chrome profiles are connected and none has been selected for this thread, so the target is ambiguous — refusing to guess.\n${list}\n` +
-        "Call select_browser with the deviceId you want (or switch_browser to pick it from inside Chrome). " +
-        "Ask the user which profile to use rather than picking one yourself."
-      );
-    }
+    const open = this.#openBrowsers(profileEmail);
+    if (!open.length) throw new BridgeError("PROFILE_UNAVAILABLE", profileEmail
+      ? "No connected browser matches CHROME_AGENT_PROFILE_EMAIL. Other profiles will not be used."
+      : "Chrome extension is not connected. Reconnect the intended browser before issuing new work.");
+    if (open.length > 1) throw this.#ambiguous(open);
     return open[0];
   }
 
-  async #hubControl(op, params) {
-    switch (op) {
-      case "list_browsers":
-        return {
-          browsers: [...this.browsers.values()]
-            .filter((b) => b.sock.readyState === WebSocket.OPEN)
-            .map((b) => ({ ...b.info, connectedAt: b.connectedAt, thisComputer: true })),
-        };
+  async #hubControl(operation, params, signal, profileEmail) {
+    checkCancelled(signal);
+    switch (operation) {
+      case "safety": return { safety: SAFETY_CAPABILITIES, relayCancellation: true };
+      case "list_browsers": return {
+        browsers: this.#openBrowsers().map(browser => ({ ...browser.info, connectedAt: browser.connectedAt, thisComputer: true })),
+      };
       case "select_browser": {
-        const entry = this.browsers.get(params.deviceId);
-        if (!entry || entry.sock.readyState !== WebSocket.OPEN) {
-          throw new Error(`Browser ${params.deviceId} is not connected. Use list_connected_browsers first.`);
-        }
-        return { selected: entry.info };
+        if (typeof params.deviceId !== "string" || !params.deviceId) throw new BridgeError("INVALID_SELECTION", "select_browser requires an exact deviceId.");
+        return { selected: this.#pickBrowser(params.deviceId, profileEmail).info };
       }
       case "switch_browser": {
-        const open = [...this.browsers.values()].filter((b) => b.sock.readyState === WebSocket.OPEN);
-        if (open.length === 0) throw new Error("No browsers connected.");
-        if (open.length === 1) return { selected: open[0].info, note: "Only one browser connected — selected automatically." };
-        // broadcast pairing request; first browser whose user clicks Connect wins
-        for (const b of open) {
-          try { b.sock.send(JSON.stringify({ method: "pair_request", params: {} })); } catch {}
-        }
-        const info = await new Promise((resolve, reject) => {
-          const waiter = { resolve: (info) => { clearTimeout(timer); resolve(info); } };
-          const timer = setTimeout(() => {
-            const i = this.pairWaiters.indexOf(waiter);
-            if (i >= 0) this.pairWaiters.splice(i, 1);
-            reject(new Error("No browser confirmed within 2 minutes. Ask the user to click the extension icon → Connect in the browser they want."));
-          }, 120000);
-          this.pairWaiters.push(waiter);
+        const open = this.#openBrowsers(profileEmail);
+        if (!open.length) throw new BridgeError("PROFILE_UNAVAILABLE", "No permitted browser is connected.");
+        if (open.length === 1) return { selected: open[0].info, note: "Only one permitted browser connected — selected automatically." };
+        return new Promise((resolve, reject) => {
+          const cleanup = () => { clearTimeout(timer); this.pairWaiters.delete(waiter); signal?.removeEventListener("abort", abort); };
+          const waiter = {
+            devices: new Set(open.map(entry => entry.info.deviceId)), profileEmail,
+            resolve: info => { cleanup(); resolve({ selected: info }); },
+            reject: error => { cleanup(); reject(error); },
+          };
+          const abort = () => waiter.reject(cancelled(signal, { method: "hub:switch_browser" }));
+          const timer = setTimeout(() => waiter.reject(new BridgeError("PAIR_TIMEOUT", "No permitted browser confirmed within 2 minutes.")), 120000);
+          this.pairWaiters.add(waiter);
+          signal?.addEventListener("abort", abort, { once: true });
+          if (signal?.aborted) { abort(); return; }
+          for (const entry of open) entry.sock.send(JSON.stringify({ method: "pair_request", params: {} }), () => {});
         });
-        return { selected: info };
       }
-      default:
-        throw new Error(`unknown hub control op: ${op}`);
+      default: throw new BridgeError("UNKNOWN_HUB_OPERATION", `Unknown hub control operation: ${operation}`);
     }
   }
 
-  // ---------- unified call API ----------
-
-  // Extensions reconnect with backoff (capped ~3s), so a call issued right
-  // after this process becomes hub — i.e. the first tool call of a session —
-  // would otherwise fail spuriously. Wait for the link before giving up.
-  async #awaitConnection(waitMs = 15000) {
-    if (this.connected) return true;
-    const deadline = Date.now() + waitMs;
-    while (Date.now() < deadline && !this.closed) {
-      await new Promise((r) => setTimeout(r, 200));
-      if (this.connected) return true;
+  async #awaitConnection(waitMs, signal) {
+    const until = Date.now() + waitMs;
+    while (!this.connected && !this.closed && Date.now() < until) {
+      checkCancelled(signal);
+      await pause(Math.min(200, Math.max(1, until - Date.now())), [signal, this.lifecycle.signal]);
     }
-    return this.connected;
+    checkCancelled(signal);
+    if (this.closed) throw new BridgeError("BRIDGE_CLOSED", "The bridge is shutting down.");
   }
 
-  async call(method, params = {}, timeoutMs = 30000, deviceId = null) {
+  async call(method, params = {}, timeoutMs = 30000, deviceId = null, options = {}) {
+    const { signal, onDispatch } = options;
+    const profileEmail = normalizeProfileEmail(options.profileEmail);
+    checkCancelled(signal, { method, deviceId });
+    if (this.closed) throw new BridgeError("BRIDGE_CLOSED", "The bridge is shutting down.");
     if (method.startsWith("hub:")) {
-      if (this.mode === "hub") return this.#hubControl(method.slice(4), params);
-      // relay transport may be mid-re-election — give it the same grace
-      if (!this.relaySocket || this.relaySocket.readyState !== 1) await this.#awaitConnection(5000);
-      if (this.mode === "hub") return this.#hubControl(method.slice(4), params); // won the election meanwhile
-      return this.#callViaRelay(method, params, timeoutMs, deviceId);
+      if (this.mode !== "hub" && !this.connected) await this.#awaitConnection(5000, signal);
+      if (this.mode !== "hub") {
+        if (profileEmail && (method === "hub:select_browser" || method === "hub:switch_browser")) {
+          const listed = await this.#callViaRelay("hub:list_browsers", {}, 10000, null, { signal, profileEmail });
+          const eligible = (listed?.browsers || []).filter(info => profileMatches(info, profileEmail));
+          const candidate = method === "hub:select_browser" ? eligible.find(info => info.deviceId === params.deviceId)
+            : eligible.length === 1 ? eligible[0] : null;
+          if (!candidate) throw new BridgeError("PROFILE_SELECTION_REQUIRED", "Choose an exact connected device matching CHROME_AGENT_PROFILE_EMAIL. No pairing request was broadcast to other profiles.");
+          const selected = await this.#callViaRelay("hub:select_browser", { ...params, deviceId: candidate.deviceId }, timeoutMs, candidate.deviceId, { signal, profileEmail });
+          if (selected?.selected?.deviceId !== candidate.deviceId || !profileMatches(selected.selected, profileEmail)) {
+            throw new BridgeError("PROFILE_MISMATCH", "The hub did not confirm the required device and profile.");
+          }
+          return selected;
+        }
+        return this.#callViaRelay(method, params, timeoutMs, deviceId, { signal, profileEmail });
+      }
+      const result = await this.#hubControl(method.slice(4), params, signal, profileEmail);
+      checkCancelled(signal, { method, deviceId });
+      if (!options.pins && result?.selected?.deviceId) this.#rememberPin(this.localPins, scopeKey(params), result.selected.deviceId);
+      return result;
     }
-    if (!this.connected) await this.#awaitConnection();
-    if (this.mode === "hub") return this.#callExtension(method, params, timeoutMs, deviceId);
-    return this.#callViaRelay(method, params, timeoutMs, deviceId);
+    if (!this.connected) await this.#awaitConnection(15000, signal);
+    checkCancelled(signal, { method, deviceId });
+    if (this.mode === "hub") {
+      const pins = options.pins || this.localPins;
+      const key = scopeKey(params);
+      const selected = pins.get(key);
+      if (selected && deviceId && selected !== deviceId) throw new BridgeError("PROFILE_PIN_CONFLICT", "Explicit selection is required to change this thread's browser.", { deviceId: selected });
+      const entry = this.#pickBrowser(selected || deviceId, profileEmail);
+      this.#rememberPin(pins, key, entry.info.deviceId);
+      return this.#send(entry.sock, method, params, timeoutMs, entry.info.deviceId, { signal, onDispatch });
+    }
+    if (!deviceId) throw new BridgeError("PROFILE_SELECTION_REQUIRED", "Select an exact deviceId before dispatching through a relay.");
+    // Existing hubs support this acknowledgment and exact device routing. A missing or
+    // mismatched acknowledgment is not permission to fall back to another browser.
+    const selected = await this.#callViaRelay("hub:select_browser", { threadTitle: params.threadTitle, deviceId }, 10000, deviceId, { signal, profileEmail });
+    if (selected?.selected?.deviceId !== deviceId || !profileMatches(selected.selected, profileEmail)) {
+      throw new BridgeError("PROFILE_MISMATCH", "The hub did not confirm the pinned device and required profile. Upgrade or inspect the hub; no browser command was sent.", { deviceId });
+    }
+    checkCancelled(signal, { method, deviceId });
+    return this.#callViaRelay(method, params, timeoutMs, deviceId, { signal, profileEmail, onDispatch });
   }
 
-  #callExtension(method, params, timeoutMs, deviceId) {
+  #send(socket, method, params, timeoutMs, deviceId, { signal, onDispatch, relay = false, profileEmail } = {}) {
     return new Promise((resolve, reject) => {
-      let entry;
-      try {
-        entry = this.#pickBrowser(deviceId);
-      } catch (e) {
-        reject(e);
+      checkCancelled(signal, { method, deviceId });
+      if (socket?.readyState !== WebSocket.OPEN) {
+        reject(new BridgeError("BRIDGE_DISCONNECTED", "The selected bridge connection is not open.", { method, deviceId }));
         return;
       }
       const id = randomUUID();
+      const browserCommand = !method.startsWith("hub:");
+      const detail = { method, ...(deviceId ? { deviceId } : {}) };
+      const cleanup = () => { this.pending.delete(id); clearTimeout(timer); signal?.removeEventListener("abort", abort); };
+      const pending = {
+        sock: socket, sent: false, browserCommand, detail,
+        resolve: value => { cleanup(); resolve(value); },
+        reject: error => { cleanup(); reject(error); },
+      };
+      const abort = () => {
+        if (relay && pending.sent && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ cancel: id }), () => {});
+        pending.reject(cancelled(signal, { ...detail, outcome: pending.sent && browserCommand ? "unknown" : "not-dispatched" }));
+      };
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`timed out after ${timeoutMs}ms waiting for the browser extension (method: ${method})`));
+        if (relay && pending.sent && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ cancel: id }), () => {});
+        pending.reject(browserCommand ? uncertain("BRIDGE_TIMEOUT", `Timed out waiting for ${method}.`, detail)
+          : new BridgeError("BRIDGE_TIMEOUT", `Timed out waiting for ${method}.`, detail));
       }, timeoutMs);
-      this.pending.set(id, { resolve, reject, timer, sock: entry.sock });
+      this.pending.set(id, pending);
+      signal?.addEventListener("abort", abort, { once: true });
+      if (signal?.aborted) { abort(); return; }
       try {
-        entry.sock.send(JSON.stringify({ id, method, params }));
-      } catch (e) {
-        this.pending.delete(id);
-        clearTimeout(timer);
-        reject(e);
+        if (browserCommand) onDispatch?.();
+        pending.sent = true;
+        const message = relay ? { id, method, params, timeoutMs: Math.max(1, timeoutMs - 18000), deviceId, profileEmail } : { id, method, params };
+        socket.send(JSON.stringify(message), (error) => {
+          if (error && this.pending.get(id) === pending) pending.reject(browserCommand
+            ? uncertain("BRIDGE_SEND_FAILED", "The bridge could not confirm delivery.", { ...detail, cause: error })
+            : new BridgeError("BRIDGE_SEND_FAILED", "The bridge could not confirm delivery.", { ...detail, cause: error }));
+        });
+      } catch (error) {
+        pending.reject(pending.sent && browserCommand ? uncertain("BRIDGE_SEND_FAILED", "The bridge could not confirm delivery.", { ...detail, cause: error }) : error);
       }
     });
   }
 
-  #callViaRelay(method, params, timeoutMs, deviceId) {
-    return new Promise((resolve, reject) => {
-      if (!this.relaySocket || this.relaySocket.readyState !== WebSocket.OPEN) {
-        reject(new Error("Not connected to the browser hub — is Chrome running with the 'Chrome Agent Bridge' extension enabled?"));
-        return;
-      }
-      const id = randomUUID();
-      // hub adds its own extension timeout PLUS up to 15s of link-wait —
-      // budget for both so the hub's answer isn't dropped as a relay timeout
-      const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new Error(`timed out after ${timeoutMs + 18000}ms waiting via hub (method: ${method})`));
-      }, timeoutMs + 18000);
-      this.pending.set(id, { resolve, reject, timer });
-      try {
-        this.relaySocket.send(JSON.stringify({ id, method, params, timeoutMs, deviceId }));
-      } catch (e) {
-        this.pending.delete(id);
-        clearTimeout(timer);
-        reject(e);
-      }
-    });
+  #callViaRelay(method, params, timeoutMs, deviceId, options) {
+    return this.#send(this.relaySocket, method, params, timeoutMs + 18000, deviceId, { ...options, relay: true });
   }
 
   get connected() {
-    if (this.mode === "hub") {
-      for (const { sock } of this.browsers.values()) {
-        if (sock.readyState === WebSocket.OPEN) return true;
-      }
-      return false;
-    }
-    return this.relaySocket?.readyState === WebSocket.OPEN;
+    return this.mode === "hub" ? this.#openBrowsers().length > 0 : this.relaySocket?.readyState === WebSocket.OPEN;
   }
 }

@@ -28,11 +28,13 @@ function scaleRgba(rgba, w, h, tw, th) {
 }
 
 // frames: base64 PNG strings (all same size); delays: ms per frame
-export async function encodeGif(frames, delays = [], quality = 10) {
+export async function encodeGif(frames, delays = [], quality = 10, signal) {
   const gif = GIFEncoder();
   let width = 0;
   let height = 0;
   for (let i = 0; i < frames.length; i++) {
+    await new Promise(resolve => setImmediate(resolve));
+    signal?.throwIfAborted();
     const png = decode(Buffer.from(frames[i], "base64"));
     let rgba = png.data;
     // normalize to RGBA
@@ -64,6 +66,8 @@ export async function encodeGif(frames, delays = [], quality = 10) {
       delay: Math.max(delays[i] ?? 600, 20),
     });
   }
+  await new Promise(resolve => setImmediate(resolve));
+  signal?.throwIfAborted();
   gif.finish();
   return { bytes: Buffer.from(gif.bytes()), width, height };
 }
