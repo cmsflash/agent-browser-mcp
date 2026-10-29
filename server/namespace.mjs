@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 
 export function normalizeRemoteContextId(value) {
   if (value == null) return null;
-  if (typeof value !== "string" || !value.trim()) throw new Error("DSH_REMOTE_CONTEXT_ID must be a non-empty opaque identity when configured.");
+  if (typeof value !== "string" || !value.trim()) throw new Error("CHROME_AGENT_REMOTE_CONTEXT_ID must be a non-empty opaque identity when configured.");
   return value;
 }
 
@@ -12,7 +12,7 @@ export function remoteContextHash(contextId) {
 }
 
 export function namespaceThreadTitle(contextId, title) {
-  const prefix = `dsh-${remoteContextHash(contextId)}-`;
+  const prefix = `ctx-${remoteContextHash(contextId)}-`;
   const label = title?.trim().toLowerCase() || "global";
   let suffix = "";
   for (const point of label) {

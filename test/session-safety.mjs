@@ -165,7 +165,7 @@ test("trusted caller identity owns explicit, nested, inherited, and global title
   assert.equal(status.safety.remoteContextHash, remoteContextHash(contextId));
   assert.equal(status.safety.callerNamespace, 1);
   const spoof = namespaceThreadTitle("other-caller", "stolen");
-  await session.execute("click", { threadTitle: spoof, tabId: 1, DSH_REMOTE_CONTEXT_ID: "other-caller", trustedTitle: true });
+  await session.execute("click", { threadTitle: spoof, tabId: 1, CHROME_AGENT_REMOTE_CONTEXT_ID: "other-caller", trustedTitle: true });
   assert.equal(bridge.calls.at(-1).params.threadTitle, namespaceThreadTitle(contextId, spoof));
   assert.throws(() => createToolSession(bridge, { remoteContextId: " " }), /non-empty/);
 });
@@ -174,7 +174,7 @@ test("namespace prefixes survive truncation and never split supplementary charac
   const first = namespaceThreadTitle("first-context", "😀".repeat(100));
   const second = namespaceThreadTitle("second-context", "😀".repeat(100));
   assert.ok(first.length <= 60);
-  assert.match(first, /^dsh-[a-f0-9]{32}-/);
+  assert.match(first, /^ctx-[a-f0-9]{32}-/);
   assert.notEqual(first, second);
   assert.equal(first.includes("\ufffd"), false);
   assert.equal(namespaceThreadTitle("first-context", " Mixed Case "), namespaceThreadTitle("first-context", "mixed case"));

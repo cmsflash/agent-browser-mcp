@@ -123,13 +123,13 @@ For an isolated companion, configure the server process, not tool arguments:
 
 ```bash
 CHROME_AGENT_PROFILE_EMAIL='work@example.test' \
-DSH_REMOTE_CONTEXT_ID='host-resolved-peer-and-caller-id' \
+CHROME_AGENT_REMOTE_CONTEXT_ID='host-resolved-peer-and-caller-id' \
 node server/index.mjs
 ```
 
 - `CHROME_AGENT_PROFILE_EMAIL` is an optional exact, case-insensitive match against the extension's reported profile email. A configured empty value is an error. Automatic and explicit selection cannot choose another reported profile. This is a Chrome-profile routing constraint, not proof of the account signed into a website.
 - A selected device stays pinned for that exact thread until an explicit successful `select_browser` or `switch_browser`. Disconnects never discard the pin, retry the action, or substitute the sole remaining profile. Pins are process-local; use the profile constraint for companion restarts. At 200 retained selections, new selections fail instead of evicting old pins.
-- `DSH_REMOTE_CONTEXT_ID` is an optional trusted, opaque caller identity. A configured empty value is an error. The server derives `dsh-<128-bit SHA-256 prefix>-` from it and adds a lowercased, bounded display suffix, keeping the complete title within Chrome's 60 UTF-16-code-unit limit. Explicit nested batch titles receive the same caller prefix; omitted nested titles inherit the parent. Threadless utilities use a namespaced `global` key. Model titles never choose the prefix. Pass ordinary titles from the gateway; do not pre-prefix them. Omission preserves local title behavior.
+- `CHROME_AGENT_REMOTE_CONTEXT_ID` is an optional trusted, opaque caller identity. A configured empty value is an error. The server derives `ctx-<128-bit SHA-256 prefix>-` from it and adds a lowercased, bounded display suffix, keeping the complete title within Chrome's 60 UTF-16-code-unit limit. Explicit nested batch titles receive the same caller prefix; omitted nested titles inherit the parent. Threadless utilities use a namespaced `global` key. Model titles never choose the prefix. Pass ordinary titles from the gateway; do not pre-prefix them. Omission preserves local title behavior.
 
 MCP initialization advertises `capabilities.experimental["chrome-agent/safety"]`; `get_status` also returns it as `safety`. Version `1` reports `stickyDevicePin`, `exactProfileEmail`, `callerNamespace: 1`, the configured `requiredProfileEmail`, and `remoteContextConfigured`/`remoteContextHash`. `get_status` accepts an optional `threadTitle`; `connected` reports available browser connections and `ready` reports whether that selection can be used.
 

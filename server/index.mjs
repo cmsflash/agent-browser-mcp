@@ -26,7 +26,7 @@ export function createMcpServer(bridge, options = {}) {
 
 export async function main() {
   const profileEmail = normalizeProfileEmail(process.env.CHROME_AGENT_PROFILE_EMAIL);
-  const remoteContextId = normalizeRemoteContextId(process.env.DSH_REMOTE_CONTEXT_ID);
+  const remoteContextId = normalizeRemoteContextId(process.env.CHROME_AGENT_REMOTE_CONTEXT_ID);
   const bridge = new Bridge(Number(process.env.CHROME_AGENT_PORT || DEFAULT_PORT));
   await bridge.start();
   const server = createMcpServer(bridge, {
